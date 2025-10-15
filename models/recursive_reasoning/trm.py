@@ -178,6 +178,11 @@ class TinyRecursiveReasoningModel_ACTV1ReasoningModule(nn.Module):
 
 
 class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
+    """
+    This is the inner recursive module of the TRM.
+    It does Deep recursion. Basically this is one `m` step.
+    The number of this steps is controlled by ACT. 
+    """
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
         super().__init__()
         self.config = config
@@ -256,6 +261,11 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         )
 
     def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Performs DEEP RECURSION as per the paper:
+        1) without tracking the grads we let the model do H - 1 cycles of L
+        2) do one full pass with grads L times
+        """
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
@@ -269,6 +279,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         # H_cycles-1 without grad
         with torch.no_grad():
             for _H_step in range(self.config.H_cycles-1):
+                # do latent recursion
                 for _L_step in range(self.config.L_cycles):
                     z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
                 z_H = self.L_level(z_H, z_L, **seq_info)
@@ -285,7 +296,14 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
 
 class TinyRecursiveReasoningModel_ACTV1(nn.Module):
-    """ACT wrapper."""
+    """
+    ACT wrapper.
+        - tracks per-sample step counts
+	    - decides which samples halt/continue
+	    - swaps in fresh batch rows for halted samples
+	    - returns logits and ACT signals 
+    """
+    
 
     def __init__(self, config_dict: dict):
         super().__init__()
