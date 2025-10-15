@@ -15,12 +15,26 @@ IGNORE_LABEL_ID = -100
 
 @dataclass
 class TinyRecursiveReasoningModel_ACTV1InnerCarry:
+    """
+    Stores the internal latent states used across recursion steps in TRM.
+
+    - z_H: the high-level latent (equivalent to `y` in the paper) - the current proposed solution.
+    - z_L: the low-level latent (equivalent to `z` in the paper) - the reasoning state used to refine z_H.
+    """
     z_H: torch.Tensor
     z_L: torch.Tensor
 
 
 @dataclass
 class TinyRecursiveReasoningModel_ACTV1Carry:
+    """
+    Tracks the full recurrent state of TRM across adaptive computation steps.
+
+    - inner_carry: holds the inner latent states (z_H ~ y, z_L ~ z).
+    - steps: counts how many reasoning steps each sample has taken.
+    - halted: boolean mask indicating which samples have finished (halted).
+    - current_data: the batch data currently associated with each active sample.
+    """
     inner_carry: TinyRecursiveReasoningModel_ACTV1InnerCarry
     
     steps: torch.Tensor
@@ -30,6 +44,22 @@ class TinyRecursiveReasoningModel_ACTV1Carry:
 
 
 class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
+    """
+    Configuration for the Tiny Recursive Reasoning Model (TRM).
+
+    Defines model architecture, recursion schedule, and halting behavior.
+
+    Key fields:
+    - batch_size, seq_len: input dimensions.
+    - vocab_size, num_puzzle_identifiers: vocabulary and puzzle ID setup.
+    - H_cycles, L_cycles: recursion depth (outer and inner loops).
+    - hidden_size, expansion, num_heads, pos_encodings: transformer/MLP parameters.
+    - halt_max_steps, halt_exploration_prob: adaptive computation (ACT) settings.
+    - mlp_t: if True, use MLP over tokens instead of attention (for small grids).
+    - no_ACT_continue: use simplified halting (no “continue” Q-learning step).
+    
+    Note: z_H ~ y (solution), z_L ~ z (reasoning state); H/L names are kept for compatibility.
+    """
     batch_size: int
     seq_len: int
     puzzle_emb_ndim: int = 0
@@ -63,7 +93,25 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
+    """
+    A single reasoning block used inside TRM's recursive network.
+
+    Corresponds to one layer of the tiny network that refines the reasoning (z) and
+    solution (y) states described in the paper. Each block applies either:
+
+    - a self-attention layer (default), or
+    - an MLP over tokens (`mlp_t=True`, used for small fixed grids),
+
+    followed by a SwiGLU feed-forward layer and RMS normalization (post-norm).
+    """
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
+        """
+         Builds either:
+            - an attention-based sublayer (for larger contexts), or
+            - an MLP-over-tokens sublayer (`mlp_t=True`, for small grids like Sudoku),
+
+        followed by a SwiGLU feed-forward layer and RMS normalization.
+        """
         super().__init__()
 
         self.config = config
@@ -88,6 +136,12 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
         self.norm_eps = config.rms_norm_eps
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        - MLP/attn
+        - Apply RMSNorm post-norm residual after that sublayer
+        - Apply a SwiGLU feed-forward MLP
+        - Apply another RMSNorm post-norm residual
+        """
         # B, L, D = hidden_states.shape
         # Post Norm
         if self.config.mlp_t:
@@ -104,7 +158,15 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
         return hidden_states
 
 class TinyRecursiveReasoningModel_ACTV1ReasoningModule(nn.Module):
+    """
+    This corresponds to the tiny network that iteratively updates
+    the reasoning (z) and solution (y) states within each recursion cycle.
+    """
     def __init__(self, layers: List[TinyRecursiveReasoningModel_ACTV1Block]):
+        """
+        - self.layers: corresponds to the number of layers in each tiny net. 
+        The paper showed that less is more and for sudoku layers = 2 is the best.
+        """
         super().__init__()
         self.layers = torch.nn.ModuleList(layers)
 
