@@ -1,18 +1,36 @@
-name: recursive_reasoning.transformers_baseline@Model_ACTV2
+# ---------- model wiring ----------
+name: recursive_reasoning.transformers_baseline@TransformerBaseline
+
+# ---------- loss head (same pattern as TRM) ----------
 loss:
   name: losses@ACTLossHead
   loss_type: stablemax_cross_entropy
 
-halt_exploration_prob: 0.1
-halt_max_steps: 16
+# ---------- ACT / runtime ----------
+halt_exploration_prob: 0.0   # baseline: no exploration
+halt_max_steps: 1            # single-step baseline (important; trainer uses this to loop ACT)
+no_ACT_continue: True        # do not compute Q-continue target (no extra inner pass)
 
-H_cycles: 1  # kept for compatibility
-H_layers: 8 
+# ---------- (H/L cycles are ignored by baseline but kept for compatibility) ----------
+H_cycles: 1
+L_cycles: 1
+H_layers: 0
+L_layers: 0
 
-hidden_size: 512  
-num_heads: 12
+# ---------- backbone ----------
+hidden_size: 512
+num_heads: 8
 expansion: 4
+dropout: 0.1
 
-puzzle_emb_ndim: ${.hidden_size}
+# ---------- embeddings / dtype ----------
+seq_len: 81
+vocab_size: 11               # 0 - <PAD>, 1 - blank, 2-10 - digits; 11 total
+num_puzzle_identifiers: 1
+puzzle_emb_ndim: 0           # baseline doesn't use puzzle-ID embeddings
+puzzle_emb_len: 0            # no prefix tokens in baseline
+pos_encodings: learned       # simple learned positions 
+forward_dtype: bfloat16
 
-pos_encodings: rope
+# ---------- batch size  ----------
+batch_size: 256
