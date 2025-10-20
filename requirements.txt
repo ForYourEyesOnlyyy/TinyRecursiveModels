@@ -1,5 +1,5 @@
-torch
-adam-atan2
+# Core ML stack (CPU/MPS compatible)
+torch              # Conda install recommended for MPS/CPU build
 einops
 tqdm
 coolname
@@ -15,6 +15,11 @@ wheel
 setuptools 
 setuptools-scm
 pydantic-core
-huggingface_hub 
 numba
-triton
+
+# Removed or replaced:
+# adam-atan2 ->  CUDA-only extension, omit entirely
+# triton ->  Not supported on macOS, skip unless needed for CPU fallback
+
+# Optional
+# xformers  # (Apple MPS–compatible attention ops, available via pip)
