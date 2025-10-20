@@ -7,7 +7,7 @@ import numpy as np
 from argdantic import ArgParser
 from pydantic import BaseModel
 from tqdm import tqdm
-from huggingface_hub import hf_hub_download
+from datasets import load_dataset
 
 from common import PuzzleDatasetMetadata
 
@@ -58,79 +58,103 @@ def shuffle_sudoku(board: np.ndarray, solution: np.ndarray):
 
 
 def convert_subset(set_name: str, config: DataProcessConfig):
-    # Read CSV
-    inputs = []
-    labels = []
-    
-    with open(hf_hub_download(config.source_repo, f"{set_name}.csv", repo_type="dataset"), newline="") as csvfile:
-        reader = csv.reader(csvfile)
-        next(reader)  # Skip header
-        for source, q, a, rating in reader:
-            if (config.min_difficulty is None) or (int(rating) >= config.min_difficulty):
-                assert len(q) == 81 and len(a) == 81
-                
-                inputs.append(np.frombuffer(q.replace('.', '0').encode(), dtype=np.uint8).reshape(9, 9) - ord('0'))
-                labels.append(np.frombuffer(a.encode(), dtype=np.uint8).reshape(9, 9) - ord('0'))
+    #  Local CSV mode 
+    if os.path.isdir(config.source_repo):
+        candidates = [
+            os.path.join(config.source_repo, f"{set_name}.csv"),
+            os.path.join(config.source_repo, set_name, f"{set_name}.csv"),
+        ]
+        csv_path = next((p for p in candidates if os.path.isfile(p)), None)
+        if csv_path is None:
+            raise FileNotFoundError(f"Could not find {set_name}.csv under {config.source_repo}")
+        print(f"[builder] using local CSV: {csv_path}")
 
-    # If subsample_size is specified for the training set,
-    # randomly sample the desired number of examples.
-    if set_name == "train" and config.subsample_size is not None:
+        inputs, labels = [], []
+
+        with open(csv_path, newline="", encoding="utf-8") as csvfile:
+            reader = csv.reader(csvfile)
+            _ = next(reader, None)  # skip header if present
+            for row in reader:
+                if len(row) != 4:
+                    continue
+                source, q, a, rating = row
+                if (config.min_difficulty is None) or (int(rating) >= config.min_difficulty):
+                    assert len(q) == 81 and len(a) == 81
+                    q_arr = np.frombuffer(q.replace('.', '0').encode(), dtype=np.uint8).reshape(9, 9) - ord('0')
+                    a_arr = np.frombuffer(a.encode(),               dtype=np.uint8).reshape(9, 9) - ord('0')
+                    inputs.append(q_arr)
+                    labels.append(a_arr)
+
         total_samples = len(inputs)
+
+    #  Hub / online mode 
+    else:
+        from datasets import load_dataset
+        ds = load_dataset(config.source_repo, split=set_name)
+        print(f"[builder] loaded split={set_name}: {len(ds)} rows from {config.source_repo}")
+
+        if config.min_difficulty is not None:
+            min_diff = int(config.min_difficulty)
+            ds = ds.filter(lambda ex: int(ex["rating"]) >= min_diff)
+            print(f"[builder] after difficulty >= {min_diff}: {len(ds)} rows")
+
+        inputs, labels = [], []
+        for row in tqdm(ds, desc=f"{set_name}"):
+            q, a = row["q"], row["a"]
+            assert len(q) == 81 and len(a) == 81
+            q_arr = np.frombuffer(q.replace('.', '0').encode(), dtype=np.uint8).reshape(9, 9) - ord('0')
+            a_arr = np.frombuffer(a.encode(),               dtype=np.uint8).reshape(9, 9) - ord('0')
+            inputs.append(q_arr)
+            labels.append(a_arr)
+
+        total_samples = len(inputs)
+
+    #  Optional subsample (train only) 
+    if set_name == "train" and config.subsample_size is not None:
         if config.subsample_size < total_samples:
-            indices = np.random.choice(total_samples, size=config.subsample_size, replace=False)
-            inputs = [inputs[i] for i in indices]
-            labels = [labels[i] for i in indices]
+            idx = np.random.choice(total_samples, size=config.subsample_size, replace=False)
+            inputs = [inputs[i] for i in idx]
+            labels = [labels[i] for i in idx]
+            print(f"[builder] subsampled {config.subsample_size}/{total_samples} rows")
 
-    # Generate dataset
+    #. Augmentation and saving
     num_augments = config.num_aug if set_name == "train" else 0
-
     results = {k: [] for k in ["inputs", "labels", "puzzle_identifiers", "puzzle_indices", "group_indices"]}
     puzzle_id = 0
     example_id = 0
-    
     results["puzzle_indices"].append(0)
     results["group_indices"].append(0)
-    
+
     for orig_inp, orig_out in zip(tqdm(inputs), labels):
         for aug_idx in range(1 + num_augments):
-            # First index is not augmented
             if aug_idx == 0:
                 inp, out = orig_inp, orig_out
             else:
                 inp, out = shuffle_sudoku(orig_inp, orig_out)
-
-            # Push puzzle (only single example)
             results["inputs"].append(inp)
             results["labels"].append(out)
             example_id += 1
-            puzzle_id += 1
-            
+            puzzle_id  += 1
             results["puzzle_indices"].append(example_id)
             results["puzzle_identifiers"].append(0)
-            
-        # Push group
         results["group_indices"].append(puzzle_id)
-        
-    # To Numpy
+
     def _seq_to_numpy(seq):
         arr = np.concatenate(seq).reshape(len(seq), -1)
-        
         assert np.all((arr >= 0) & (arr <= 9))
         return arr + 1
-    
+
     results = {
         "inputs": _seq_to_numpy(results["inputs"]),
         "labels": _seq_to_numpy(results["labels"]),
-        
-        "group_indices": np.array(results["group_indices"], dtype=np.int32),
+        "group_indices":  np.array(results["group_indices"],  dtype=np.int32),
         "puzzle_indices": np.array(results["puzzle_indices"], dtype=np.int32),
         "puzzle_identifiers": np.array(results["puzzle_identifiers"], dtype=np.int32),
     }
 
-    # Metadata
     metadata = PuzzleDatasetMetadata(
         seq_len=81,
-        vocab_size=10 + 1,  # PAD + "0" ... "9"
+        vocab_size=11,
         pad_id=0,
         ignore_label_id=0,
         blank_identifier_id=0,
@@ -141,21 +165,16 @@ def convert_subset(set_name: str, config: DataProcessConfig):
         sets=["all"]
     )
 
-    # Save metadata as JSON.
     save_dir = os.path.join(config.output_dir, set_name)
     os.makedirs(save_dir, exist_ok=True)
-    
     with open(os.path.join(save_dir, "dataset.json"), "w") as f:
         json.dump(metadata.model_dump(), f)
-        
-    # Save data
     for k, v in results.items():
         np.save(os.path.join(save_dir, f"all__{k}.npy"), v)
-        
-    # Save IDs mapping (for visualization only)
     with open(os.path.join(config.output_dir, "identifiers.json"), "w") as f:
         json.dump(["<blank>"], f)
 
+    print(f"[builder] wrote split={set_name} → {save_dir}")
 
 @cli.command(singleton=True)
 def preprocess_data(config: DataProcessConfig):

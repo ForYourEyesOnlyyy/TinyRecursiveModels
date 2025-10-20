@@ -1,0 +1,4 @@
+data/
+sudoku-extreme/
+.DS_Store
+__pycache__/
