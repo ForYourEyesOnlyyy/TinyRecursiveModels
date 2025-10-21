@@ -22,15 +22,16 @@ hidden_size: 512
 num_heads: 8
 expansion: 4
 dropout: 0.1
+n_layers: 6
 
 # ---------- embeddings / dtype ----------
-seq_len: 81
-vocab_size: 11               # 0 - <PAD>, 1 - blank, 2-10 - digits; 11 total
-num_puzzle_identifiers: 1
+# seq_len: 81
+# vocab_size: 11               # 0 - <PAD>, 1 - blank, 2-10 - digits; 11 total
+# num_puzzle_identifiers: 1
 puzzle_emb_ndim: 0           # baseline doesn't use puzzle-ID embeddings
 puzzle_emb_len: 0            # no prefix tokens in baseline
 pos_encodings: learned       # simple learned positions 
 forward_dtype: bfloat16
 
 # ---------- batch size  ----------
-batch_size: 256
+# batch_size: 256
