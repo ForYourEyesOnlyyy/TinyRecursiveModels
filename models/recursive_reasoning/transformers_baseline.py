@@ -4,7 +4,7 @@ from pydantic import BaseModel
 
 IGNORE_LABEL_ID = -100  # if used by losmodels/recursive_reasoning/transformers_baseline.pyses
 
-class TransformerBaselineConfig(BaseModel):
+class SudokuTransformerConfig(BaseModel):
     # data / vocab
     seq_len: int                    # 81 for Sudoku
     vocab_size: int                 # 11: {0=PAD, 1=blank, 2..10=digits 1..9}
@@ -26,7 +26,7 @@ class SudokuTransformer(nn.Module):
     - logits: FloatTensor [B, L, vocab_size]
     """
 
-    def __init__(self, cfg: TransformerBaselineConfig):
+    def __init__(self, cfg: SudokuTransformerConfig):
         super().__init__()
         self.cfg = cfg
         d_model = cfg.hidden_size
