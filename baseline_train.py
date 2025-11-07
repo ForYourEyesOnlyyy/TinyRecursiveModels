@@ -281,6 +281,7 @@ def main(cfg: Dict):
         wandb.init(
             project=cfg.wandb.get("project", "baseline"),
             name=getattr(cfg, "run_name", "run"),
+            group = cfg.wandb.get("group", None),
             mode=cfg.wandb.get("mode", "online"),
             config=dict(cfg)
         )
