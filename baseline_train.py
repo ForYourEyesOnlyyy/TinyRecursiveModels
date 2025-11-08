@@ -55,19 +55,84 @@ def build_model_from_cfg(cfg: DictConfig, metadata, device: torch.device) -> nn.
     arch_dict = OmegaConf.to_container(cfg.arch, resolve=True)
 
     # rebuild config with injected runtime params
-    model_cfg = {
+    model_cfg = dict(
         **arch_dict,
-        "seq_len": int(metadata.seq_len),
-        "vocab_size": int(metadata.vocab_size)
-    }
+        seq_len = int(metadata.seq_len),
+        vocab_size =  int(metadata.vocab_size)
+    )
 
-    model_cfg = SudokuTransformerConfig(**model_cfg)
     model = model_cls(model_cfg).to(device)
     return model
 
 
 
 # ---utility---
+
+def _resolve_ckpt_dir(cfg) -> str:
+    # Default: checkpoints/<project>/<run_name>
+    project = (cfg.wandb.get("project", None) if getattr(cfg, "wandb", None) else None) \
+              or getattr(cfg, "project_name", "baseline")
+    run_name = getattr(cfg, "run_name", "run")
+    base = cfg.checkpoint_dir or os.path.join("checkpoints", project, run_name)
+    os.makedirs(base, exist_ok=True)
+    return base
+
+def save_checkpoint(path: str, model, opt, epoch: int, step: int, cfg, best_score=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    ckpt = {
+        "model_state": model.state_dict(),
+        "optimizer_state": opt.state_dict() if opt is not None else None,
+        "epoch": epoch,
+        "step": step,
+        "best_score": best_score,
+        "config": OmegaConf.to_container(cfg, resolve=True),
+
+        # RNG states for reproducibility
+        "rng_python": random.getstate(),
+        "rng_numpy": np.random.get_state(),
+        "rng_torch": torch.random.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        ckpt["rng_torch_cuda"] = torch.cuda.get_rng_state_all()
+    torch.save(ckpt, path)
+    print(f"[checkpoint] saved: {path}")
+
+def load_checkpoint(path: str, model, opt, device: torch.device):
+    if not (path and os.path.isfile(path)):
+        print(f"[checkpoint] no checkpoint at: {path}")
+        return 0, 0, None
+
+    ckpt = torch.load(path, map_location=device)
+    # model
+    missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
+    if hasattr(missing, "__len__"):
+        if missing or unexpected:
+            print(f"[checkpoint] model strict=False: missing={len(missing)} unexpected={len(unexpected)}")
+
+    # optimizer
+    if opt is not None and ckpt.get("optimizer_state") is not None:
+        try:
+            opt.load_state_dict(ckpt["optimizer_state"])
+        except Exception as e:
+            print(f"[checkpoint] optimizer state not loaded: {e}")
+
+    # RNG
+    try:
+        random.setstate(ckpt["rng_python"])
+        np.random.set_state(ckpt["rng_numpy"])
+        torch.random.set_rng_state(ckpt["rng_torch"])
+        if "rng_torch_cuda" in ckpt and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(ckpt["rng_torch_cuda"])
+    except Exception as e:
+        print(f"[checkpoint] RNG restore failed: {e}")
+
+    epoch = int(ckpt.get("epoch", 0))
+    step = int(ckpt.get("step", 0))
+    best_score = ckpt.get("best_score", None)
+    print(f"[checkpoint] loaded: {path} (epoch={epoch}, step={step}, best={best_score})")
+    return epoch, step, best_score
+
 def get_device(cfg: DictConfig) -> torch.device:
     if cfg.device == "cuda" and torch.cuda.is_available():
         return torch.device("cuda")
@@ -295,8 +360,22 @@ def main(cfg: Dict):
 
     train_loader, _ = make_dataloader(cfg, split="train")
 
+
+    # --- Checkpoint resume ---
+    ckpt_dir = _resolve_ckpt_dir(cfg)
+    last_ckpt = os.path.join(ckpt_dir, "last.ckpt")
+    best_ckpt = os.path.join(ckpt_dir, "best.ckpt")
+    best_score = None
+
+    start_epoch = 0
     step = 0
-    master_bar = tqdm(range(cfg.epochs), desc="Training", position=0, leave=True)
+
+    if getattr(cfg, "resume", False) and getattr(cfg, "load_checkpoint", None):
+        start_epoch, step, best_score = load_checkpoint(cfg.load_checkpoint, model, opt, device)
+        # continue from the next epoch
+        start_epoch = min(start_epoch, cfg.epochs - 1)
+
+    master_bar = tqdm(range(start_epoch, cfg.epochs), desc="Training", position=0, leave=True)
     for epoch in master_bar:
         step = train_one_epoch(
             model, train_loader, device,
@@ -325,6 +404,23 @@ def main(cfg: Dict):
             "eval_loss": f"{eval_loss:.4f}",
             "eval_blank_acc": f"{eval_acc_blank:.3f}"
             })
+
+            # save best
+            if getattr(cfg, "save_best", True):
+                metric_name = getattr(cfg, "best_metric", "eval_acc_blank")
+                mode = getattr(cfg, "best_mode", "max")
+                current = eval_acc_blank if metric_name == "eval_acc_blank" else eval_loss
+                better = (best_score is None) or ((mode == "max" and current > best_score) or (mode == "min" and current < best_score))
+                if better:
+                    best_score = current
+                    save_checkpoint(best_ckpt, model, opt, epoch, step, cfg, best_score=best_score)
+
+         # save last every N epochs 
+        if (epoch + 1) % max(1, getattr(cfg, "save_every", cfg.eval_interval)) == 0:
+            save_checkpoint(last_ckpt, model, opt, epoch, step, cfg, best_score=best_score)
+    
+    # final save
+    save_checkpoint(last_ckpt, model, opt, cfg.epochs - 1, step, cfg, best_score=best_score)
 
     if use_wandb:
         wandb.finish()
