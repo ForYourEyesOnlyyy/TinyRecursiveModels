@@ -1,6 +1,6 @@
 import torch, torch.nn as nn, torch.nn.functional as F
 from typing import Dict, Tuple
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 IGNORE_LABEL_ID = -100  # if used by losmodels/recursive_reasoning/transformers_baseline.pyses
 
@@ -26,26 +26,30 @@ class SudokuTransformer(nn.Module):
     - logits: FloatTensor [B, L, vocab_size]
     """
 
-    def __init__(self, cfg: SudokuTransformerConfig):
+    def __init__(self, cfg: dict):
         super().__init__()
-        self.cfg = cfg
-        d_model = cfg.hidden_size
-        d_ff = int(cfg.expansion * d_model)
-        self.token_emb = nn.Embedding(cfg.vocab_size, d_model, padding_idx=0)
-        self.pos_emb   = nn.Embedding(cfg.seq_len, d_model)
+        try:
+            self.cfg = SudokuTransformerConfig(**cfg)
+        except ValidationError as e:
+            raise ValueError(f"[SudokuTransformerConfig] bad config: {e}") from e
+        
+        d_model = self.cfg.hidden_size
+        d_ff = int(self.cfg.expansion * d_model)
+        self.token_emb = nn.Embedding(self.cfg.vocab_size, d_model, padding_idx=0)
+        self.pos_emb   = nn.Embedding(self.cfg.seq_len, d_model)
 
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
-            nhead=cfg.num_heads,
+            nhead=self.cfg.num_heads,
             dim_feedforward=d_ff,
-            dropout=cfg.dropout,
+            dropout=self.cfg.dropout,
             batch_first=True,
             activation="gelu",
             norm_first=True
         )
 
-        self.encoder = nn.TransformerEncoder(encoder_layer=enc_layer, num_layers=cfg.n_layers)
-        self.head = nn.Linear(d_model, cfg.hidden_size)
+        self.encoder = nn.TransformerEncoder(encoder_layer=enc_layer, num_layers=self.cfg.n_layers)
+        self.head = nn.Linear(d_model, self.cfg.hidden_size)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         """
