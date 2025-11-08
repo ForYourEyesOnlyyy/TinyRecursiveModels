@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pydantic import BaseModel, ValidationError
 
-IGNORE_LABEL_ID = -100  # if used by losmodels/recursive_reasoning/transformers_baseline.pyses
+IGNORE_LABEL_ID = -100  
 
 
 class HRecTransformerConfig(BaseModel): 
@@ -42,7 +42,8 @@ class HRecTransformer(nn.Module):
     enabling iterative refinement with TBPTT-style training.
     """
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: Dict):
+        super().__init__()
         try:
             self.cfg = HRecTransformerConfig(**cfg)
         except ValidationError as e:
@@ -63,7 +64,7 @@ class HRecTransformer(nn.Module):
             norm_first=True
         )
         self.encoder = nn.TransformerEncoder(encoder_layer=enc_layer, num_layers=self.cfg.n_layers)
-        self.head = nn.Linear(d_model, self.cfg.hidden_size)
+        self.head = nn.Linear(d_model, self.cfg.vocab_size)
 
         # recursion
         self.alpha = nn.Parameter(torch.full((), self.cfg.state_scale_init))
