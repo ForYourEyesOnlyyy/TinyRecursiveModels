@@ -1,24 +1,23 @@
-import os, math, json
+import os
+import math
+import random
 from itertools import islice
 from typing import Dict, Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from omegaconf import DictConfig, OmegaConf
-import importlib
-import pydantic
 import hydra
-from functools import partial
-
-from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
-from models.recursive_reasoning.transformers_baseline import SudokuTransformerConfig
-from utils.functions import load_model_class
-from models.losses import IGNORE_LABEL_ID
-import random
+import pydantic
 from tqdm import tqdm
 import wandb
+
+from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig
+from utils.functions import load_model_class
+from models.losses import IGNORE_LABEL_ID
 
 class ArchConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra='allow')
