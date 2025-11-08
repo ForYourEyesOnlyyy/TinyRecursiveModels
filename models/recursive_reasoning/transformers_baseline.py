@@ -1,5 +1,5 @@
 import torch, torch.nn as nn, torch.nn.functional as F
-from typing import Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from pydantic import BaseModel, ValidationError
 
 IGNORE_LABEL_ID = -100  # if used by losmodels/recursive_reasoning/transformers_baseline.pyses
@@ -26,7 +26,7 @@ class SudokuTransformer(nn.Module):
     - logits: FloatTensor [B, L, vocab_size]
     """
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: Dict):
         super().__init__()
         try:
             self.cfg = SudokuTransformerConfig(**cfg)
@@ -49,9 +49,9 @@ class SudokuTransformer(nn.Module):
         )
 
         self.encoder = nn.TransformerEncoder(encoder_layer=enc_layer, num_layers=self.cfg.n_layers)
-        self.head = nn.Linear(d_model, self.cfg.hidden_size)
+        self.head = nn.Linear(d_model, self.cfg.vocab_size)
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    def forward(self, inputs: torch.Tensor, return_all_logits: bool=False) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
         """
         inputs: [B, L] long; logits: [B, L, V]
         Ensures inputs are on the same device as the module parameters (MPS-safe).
@@ -68,6 +68,6 @@ class SudokuTransformer(nn.Module):
         h = self.encoder(h)
         logits = self.head(h)
 
-        return logits
+        return logits, None
 
 

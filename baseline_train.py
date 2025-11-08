@@ -61,6 +61,7 @@ def build_model_from_cfg(cfg: DictConfig, metadata, device: torch.device) -> nn.
     )
 
     model = model_cls(model_cfg).to(device)
+    print(f"[model] Loaded model: {cfg.arch.name}")
     return model
 
 
@@ -95,7 +96,7 @@ def save_checkpoint(path: str, model, opt, epoch: int, step: int, cfg, best_scor
     if torch.cuda.is_available():
         ckpt["rng_torch_cuda"] = torch.cuda.get_rng_state_all()
     torch.save(ckpt, path)
-    print(f"[checkpoint] saved: {path}")
+    # print(f"[checkpoint] saved: {path}")
 
 def load_checkpoint(path: str, model, opt, device: torch.device):
     if not (path and os.path.isfile(path)):
@@ -210,6 +211,7 @@ def train_one_epoch(
         loader: DataLoader,
         device: torch.device,
         *,
+        deep_supervision: bool,
         blank_id: int,
         base_lr: float,
         warmup:int,
@@ -218,25 +220,48 @@ def train_one_epoch(
         step0: int,
         opt: torch.optim.Optimizer,
         use_wandb: bool,
-        position=1  # TQDM pretty stuff
+        position=1,                                # TQDM
+        epoch: int = 0,                            # TQDM
+        total_epochs: int = 1,                     # TQDM 
+        total_train_batches: int | None = None,    # TQDM
         ) -> int:
     model.train()
     step = step0
     
-    bar = tqdm(loader, desc=f"Train",
-               position=position, leave=False)
+    bar = tqdm(
+                loader, 
+                desc=f"Train ({epoch+1}/{total_epochs})",
+                total=total_train_batches,
+                position=position, 
+                leave=False, 
+                dynamic_ncols=True
+            )
     for set_name, batch, _ in bar:
         step += 1
         inputs = batch['inputs'].to(device)
         labels = batch['labels'].to(device)
 
-        logits = model(inputs)
 
-        loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            labels.view(-1),
-            ignore_index=IGNORE_LABEL_ID
-        )
+        final_logits, logits_steps = model(inputs, return_all_logits=True)
+
+
+        if deep_supervision and logits_steps:
+            losses = [
+                F.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    labels.view(-1),
+                    ignore_index=IGNORE_LABEL_ID
+                ) for logits in logits_steps
+            ]
+            loss = sum(losses) / len(losses)
+        else:
+            loss = F.cross_entropy(
+                final_logits.view(-1, final_logits.size(-1)),
+                labels.view(-1),
+                ignore_index=IGNORE_LABEL_ID
+            )
+
+
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -248,8 +273,8 @@ def train_one_epoch(
             pg["lr"] = lr_now
 
         # metrics and logging
-        acc_blank = blank_accuracy(logits, labels, inputs, blank_id=blank_id)
-        acc_all   = global_accuracy(logits, labels)
+        acc_blank = blank_accuracy(final_logits, labels, inputs, blank_id=blank_id)
+        acc_all   = global_accuracy(final_logits, labels)
 
         bar.set_postfix({
             "loss": f"{loss.item():.4f}",
@@ -275,9 +300,12 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     *,
+    deep_supervision: bool,
     blank_id: int,
     max_batches: int | None = None,
-    position=2  # TQDM stuff
+    position=2,                         # TQDM
+    epoch: int = 1,                     # TQDM 
+    total_epochs: int = 1,              # TQDM
     ) -> Tuple[float, float, float]:
 
     # sanity check
@@ -288,22 +316,41 @@ def evaluate(
     losses, acc_blanks, acc_alls = [], [], []
 
     iterable = loader if max_batches is None else islice(loader, max_batches)
-    bar = tqdm(iterable, desc="Eval", position=position, leave=False)
+    bar = tqdm(
+                iterable, 
+                desc=f"Eval ({epoch+1}/{total_epochs})", 
+                total=max_batches, 
+                position=position, 
+                leave=False, 
+                dynamic_ncols=True
+            )
     for set_name, batch, _ in bar:
         inputs = batch['inputs'].to(device)
         labels = batch['labels'].to(device)
 
-        logits = model(inputs)
-        loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
+        final_logits, logits_steps = model(inputs, return_all_logits=True)
+
+
+        if deep_supervision and logits_steps:
+            losses = [
+                F.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    labels.view(-1),
+                    ignore_index=IGNORE_LABEL_ID
+                ) for logits in logits_steps
+            ]
+            loss = sum(losses) / len(losses)
+        else:
+            loss = F.cross_entropy(
+                final_logits.view(-1, final_logits.size(-1)),
                 labels.view(-1),
                 ignore_index=IGNORE_LABEL_ID
             )
         
         # metrics and logging
         losses.append(loss.item())
-        acc_b = blank_accuracy(logits, labels, inputs, blank_id=blank_id)
-        acc_a = global_accuracy(logits, labels)
+        acc_b = blank_accuracy(final_logits, labels, inputs, blank_id=blank_id)
+        acc_a = global_accuracy(final_logits, labels)
         acc_blanks.append(acc_b)
         acc_alls.append(acc_a)
 
@@ -332,6 +379,7 @@ def main(cfg: Dict):
     
     blank_id = cfg.blank_id
     model = build_model_from_cfg(cfg, train_meta, device) # model is on device
+    deep_supervision = cfg.arch.get("deep_supervision", False)
 
     opt = torch.optim.AdamW(
         model.parameters(),
@@ -374,10 +422,11 @@ def main(cfg: Dict):
         # continue from the next epoch
         start_epoch = min(start_epoch, cfg.epochs - 1)
 
-    master_bar = tqdm(range(start_epoch, cfg.epochs), desc="Training", position=0, leave=True)
+    master_bar = tqdm(range(start_epoch, cfg.epochs), desc="Training", position=0, leave=True, dynamic_ncols=True)
     for epoch in master_bar:
         step = train_one_epoch(
             model, train_loader, device,
+            deep_supervision=deep_supervision,
             blank_id=blank_id,
             base_lr=cfg.lr,
             warmup=cfg.lr_warmup_steps,
@@ -386,11 +435,22 @@ def main(cfg: Dict):
             step0=step,
             opt=opt,
             use_wandb=use_wandb,
-            position=1
+            position=1,
+            epoch=epoch,
+            total_epochs=cfg.epochs,
+            total_train_batches=steps_per_epoch
         )
         # eval periodically to speedup runtime
         if (epoch + 1) % max(1, cfg.eval_interval) == 0 and eval_loader is not None:
-            eval_loss, eval_acc_all, eval_acc_blank = evaluate(model, eval_loader, device, blank_id=blank_id, max_batches=cfg.max_eval_batches, position=2)
+            eval_loss, eval_acc_all, eval_acc_blank = evaluate(
+                model, eval_loader, device, 
+                deep_supervision=deep_supervision, 
+                blank_id=blank_id, 
+                max_batches=cfg.max_eval_batches, 
+                position=2,
+                epoch=epoch,
+                total_epochs=cfg.epochs,
+            )
             if use_wandb:
                 wandb.log({
                     "eval/loss_ce": eval_loss,
