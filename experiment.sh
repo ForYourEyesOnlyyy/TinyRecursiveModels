@@ -1,6 +1,6 @@
 run_name="baseline_transformer_sudoku"
 
-python baseline_train.py \
+python train.py \
   arch=hrec_transformer \
   data_paths="[data/sudoku-extreme-1k-aug-1000]" \
   epochs=1000 \
