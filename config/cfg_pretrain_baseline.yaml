@@ -38,7 +38,7 @@ best_mode: "max"             # "max" or "min"
 
 # wandb
 wandb:
-  group: sandbox
+  group: 1_rec_cycle
   enabled: true
   project: sudoku_baseline
   entity: mrtshv-innopolis-university

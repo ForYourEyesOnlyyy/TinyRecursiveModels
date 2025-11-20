@@ -7,5 +7,5 @@ python baseline_train.py \
   eval_interval=20 \
   lr=1e-3 \
   weight_decay=0.1 \
-  global_batch_size=256 \
-  +run_name=HRec6_6_compute_all
+  global_batch_size=128 \
+  +run_name=Hrec15_3_alternative
