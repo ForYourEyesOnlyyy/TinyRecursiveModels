@@ -2,7 +2,7 @@ import os
 import math
 import random
 from itertools import islice
-from typing import Dict, Tuple
+from typing import List, Dict, Tuple, Optional, Any
 
 import numpy as np
 import torch
@@ -20,10 +20,88 @@ from utils.functions import load_model_class
 from models.losses import IGNORE_LABEL_ID
 
 class ArchConfig(pydantic.BaseModel):
+    """
+    Architecture config: holds model class name and arbitrary extra hyperparams
+    from `arch:` in the YAML.
+    """
     model_config = pydantic.ConfigDict(extra='allow')
     name: str
 
-def make_dataloader(cfg, split="train"):
+class TrainConfig(pydantic.BaseModel):
+    """
+    Global training config (TRM-style), constructed once from Hydra's DictConfig.
+    """
+    model_config = pydantic.ConfigDict(extra='allow')
+
+    # Architecture sub-config
+    arch: ArchConfig
+
+    # Data
+    data_paths: List[str]
+    data_split_train: str
+    data_split_eval: str
+    blank_id: int
+    global_batch_size: int
+    max_eval_batches: Optional[int] = None
+
+    # Optimizer
+    lr: float
+    lr_min_ratio: float = 1.0
+    lr_warmup_steps: int = 0
+    weight_decay: float = 0.0
+    beta1: float = 0.9
+    beta2: float = 0.999
+
+    # Training
+    seed: int = 0
+    epochs: int
+    eval_interval: int
+    device: str = "auto"  # "cpu" | "cuda" | "mps" | "auto"
+
+    # Checkpointing
+    checkpoint_dir: Optional[str] = None
+    save_every: Optional[int] = None
+    save_best: bool = True
+    resume: bool = False
+    load_checkpoint: Optional[str] = None
+    best_metric: str = "eval_acc_blank"
+    best_mode: str = "max"  # "max" or "min"
+
+    # Logging
+    wandb: dict[str, Any] = {}
+
+def load_synced_config(hydra_cfg: DictConfig) -> TrainConfig:
+    """
+    Convert Hydra DictConfig into a validated PretrainConfig, and fill in
+    reasonable defaults for project_name, run_name, checkpoint_dir, save_every.
+    """
+    cfg_dict = OmegaConf.to_container(hydra_cfg, resolve=True)
+    cfg = TrainConfig(**cfg_dict)
+
+    # project_name
+    if cfg.project_name is None:
+        proj = cfg.wandb.get("project") if cfg.wandb else None
+        if proj is None:
+            proj = cfg.arch.name + "-" + os.path.basename(cfg.data_paths[0]).capitalize()
+        cfg.project_name = proj
+
+    # run_name
+    if cfg.run_name is None:
+        # use model class name suffix by default
+        cfg.run_name = cfg.arch.name.split("@")[-1]
+
+    # checkpoint_dir
+    if cfg.checkpoint_dir is None:
+        cfg.checkpoint_dir = os.path.join("checkpoints", cfg.project_name, cfg.run_name)
+
+    # save_every: default to eval_interval if not explicitly set
+    if cfg.save_every is None:
+        cfg.save_every = cfg.eval_interval
+
+    return cfg
+
+
+def make_dataloader(cfg: TrainConfig, split:str="train"):
     ds_cfg = PuzzleDatasetConfig(
         seed=cfg.seed,
         dataset_paths=cfg.data_paths, 
@@ -42,7 +120,7 @@ def make_dataloader(cfg, split="train"):
     )
     return loader, dataset.metadata
 
-def build_model_from_cfg(cfg: DictConfig, metadata, device: torch.device) -> nn.Module:
+def build_model_from_cfg(cfg: TrainConfig, metadata, device: torch.device) -> nn.Module:
     """
     Load model class dynamically
     - cfg.arch.name must be like: "recursive_reasoning.transformers_baseline@SudokuTransformer"
@@ -51,16 +129,19 @@ def build_model_from_cfg(cfg: DictConfig, metadata, device: torch.device) -> nn.
     # resolve model class
     model_cls = load_model_class(cfg.arch.name)
 
-    arch_dict = OmegaConf.to_container(cfg.arch, resolve=True)
+    arch_dict = cfg.arch.model_dump()
+
+    for k in ("name", "seq_len", "vocab_size", "num_puzzle_identifiers"):
+        arch_dict.pop(k, None)
 
     # rebuild config with injected runtime params
-    model_cfg = dict(
+    model_cfg_dict = {
         **arch_dict,
-        seq_len = int(metadata.seq_len),
-        vocab_size =  int(metadata.vocab_size)
-    )
+        "seq_len": int(metadata.seq_len),
+        "vocab_size": int(metadata.vocab_size),
+    }
 
-    model = model_cls(model_cfg).to(device)
+    model = model_cls(model_cfg_dict).to(device)
     print(f"[model] Loaded model: {cfg.arch.name}")
     return model
 
@@ -68,7 +149,7 @@ def build_model_from_cfg(cfg: DictConfig, metadata, device: torch.device) -> nn.
 
 # ---utility---
 
-def _resolve_ckpt_dir(cfg) -> str:
+def _resolve_ckpt_dir(cfg:TrainConfig) -> str:
     # Default: checkpoints/<project>/<run_name>
     project = (cfg.wandb.get("project", None) if getattr(cfg, "wandb", None) else None) \
               or getattr(cfg, "project_name", "baseline")
@@ -77,7 +158,7 @@ def _resolve_ckpt_dir(cfg) -> str:
     os.makedirs(base, exist_ok=True)
     return base
 
-def save_checkpoint(path: str, model, opt, epoch: int, step: int, cfg, best_score=None):
+def save_checkpoint(path: str, model, opt, epoch: int, step: int, cfg: TrainConfig, best_score=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     ckpt = {
@@ -86,7 +167,7 @@ def save_checkpoint(path: str, model, opt, epoch: int, step: int, cfg, best_scor
         "epoch": epoch,
         "step": step,
         "best_score": best_score,
-        "config": OmegaConf.to_container(cfg, resolve=True),
+        "config": cfg.model_dump(),
 
         # RNG states for reproducibility
         "rng_python": random.getstate(),
@@ -133,7 +214,7 @@ def load_checkpoint(path: str, model, opt, device: torch.device):
     print(f"[checkpoint] loaded: {path} (epoch={epoch}, step={step}, best={best_score})")
     return epoch, step, best_score
 
-def get_device(cfg: DictConfig) -> torch.device:
+def get_device(cfg: TrainConfig) -> torch.device:
     if cfg.device == "cuda" and torch.cuda.is_available():
         return torch.device("cuda")
     if cfg.device == "mps" and torch.backends.mps.is_available():
@@ -368,7 +449,11 @@ def evaluate(
 # ---hyra---
 
 @hydra.main(config_path="config", config_name="cfg_pretrain_baseline", version_base=None)
-def main(cfg: Dict):
+def main(hydra_cfg: DictConfig):
+
+    # Convert & validate once
+    cfg = load_synced_config(hydra_cfg)
+
     set_seed(cfg.seed)
     device = get_device(cfg)
     print(f"[device] {device}")
@@ -379,7 +464,7 @@ def main(cfg: Dict):
     
     blank_id = cfg.blank_id
     model = build_model_from_cfg(cfg, train_meta, device) # model is on device
-    deep_supervision = cfg.arch.get("deep_supervision", False)
+    deep_supervision = getattr(cfg.arch, "deep_supervision", False)
 
     opt = torch.optim.AdamW(
         model.parameters(),
