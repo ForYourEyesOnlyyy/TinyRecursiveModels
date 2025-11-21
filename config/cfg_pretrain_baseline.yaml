@@ -1,5 +1,5 @@
 defaults:
-  - arch: transformers_baseline
+  - arch: hrec_transformer
   - _self_
 
 project_name: sudoku_baseline

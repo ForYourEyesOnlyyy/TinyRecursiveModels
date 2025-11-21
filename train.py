@@ -86,9 +86,40 @@ def load_synced_config(hydra_cfg: DictConfig) -> TrainConfig:
         cfg.project_name = proj
 
     # run_name
-    if cfg.run_name is None:
-        # use model class name suffix by default
-        cfg.run_name = cfg.arch.name.split("@")[-1]
+
+    # for sweeps make meaningfull names
+    if not hasattr(cfg, "run_name") or cfg.run_name is None:
+        # For each architecture we hardcode name identifiers we need
+        if cfg.arch.name.split("@")[-1] == "SudokuTransformer":
+            base = "Baseline"
+            n_layers = getattr(cfg.arch, "n_layers", None)
+            parts = [base]
+            if n_layers is not None:
+                parts.append(f"L{n_layers}")
+        
+        elif cfg.arch.name.split("@")[-1] == "HRecTransformer":
+            base = "HRec"
+            n_layers = getattr(cfg.arch, "n_layers", None)
+            rec_steps = getattr(cfg.arch, "recursion_steps", None)
+            tbptt = getattr(cfg.arch, "detach_till_last", None)
+            ds = getattr(cfg.arch, "deep_supervision", None)
+            ru = getattr(cfg.arch, "residual_update", None)
+
+            parts = [base]
+            if n_layers is not None:
+                parts.append(f"L{n_layers}")
+            if rec_steps is not None:
+                parts.append(f"T{rec_steps}")
+            if tbptt is not None:
+                parts.append(f"TBPTT={tbptt}")
+            if ds is not None:
+                parts.append(f"DS={ds}")
+            if ru is not None:
+                parts.append(f"RU={ru}")
+        else:
+            parts ['UNK_ARCH']
+
+        cfg.run_name = "_".join(parts)
 
     # checkpoint_dir
     if cfg.checkpoint_dir is None:
@@ -475,12 +506,35 @@ def main(hydra_cfg: DictConfig):
 
     use_wandb = bool(getattr(cfg, "wandb", {}).get("enabled", False)) and (wandb is not None)
     if use_wandb:
+        # Make dynamic tagging
+        base_name = cfg.arch.name.split("@")[-1]
+        # This works for any arch, because if it's None - then it won't be tagged
+        n_layers  = getattr(cfg.arch, "n_layers", None)
+        rec_steps = getattr(cfg.arch, "recursion_steps", None)
+        tbptt     = getattr(cfg.arch, "detach_till_last", None)
+        ds        = getattr(cfg.arch, "deep_supervision", None)
+        ru        = getattr(cfg.arch, "residual_update", None)
+
+        tags = [base_name]
+        if n_layers is not None:
+            tags.append(f"L={n_layers}")
+        if rec_steps is not None:
+            tags.append(f"T={rec_steps}")
+        if tbptt is not None:
+            tags.append("TBPTT" if tbptt else "FullBPTT")
+        if ds is not None:
+            tags.append("DS" if ds else "noDS")
+        if ru is not None:
+            tags.append("RU" if ru else "noRU")
+
+
         wandb.init(
             project=cfg.wandb.get("project", "baseline"),
             name=getattr(cfg, "run_name", "run"),
             group = cfg.wandb.get("group", None),
             mode=cfg.wandb.get("mode", "online"),
-            config=dict(cfg)
+            config=dict(cfg),
+            tags=tags,
         )
         wandb.watch(model)
         print(f"[W&B] Logging enabled — run: {wandb.run.name if wandb.run else 'None'}")
