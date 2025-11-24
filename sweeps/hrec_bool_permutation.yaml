@@ -1,0 +1,28 @@
+program: train.py
+method: grid
+
+project: sudoku_baseline
+
+metric:
+  name: eval/acc_blank
+  goal: maximize
+
+parameters:
+  arch.detach_till_last:
+    values: [true, false]
+
+  arch.deep_supervision:
+    values: [true, false]
+
+  arch.residual_update:
+    values: [true, false]
+
+command:
+  - ${env}
+  - python
+  - train_sweep.py
+  - epochs=2
+  - arch=hrec_transformer
+  - arch.n_layers=3
+  - arch.recursion_steps=2
+  - wandb.group=hrec_bool_permut_test

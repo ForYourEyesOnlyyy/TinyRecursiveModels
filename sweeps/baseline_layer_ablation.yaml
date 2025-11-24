@@ -1,0 +1,20 @@
+program: train.py
+method: grid
+
+project: sudoku_baseline
+
+metric:
+  name: eval/acc_blank
+  goal: maximize
+
+parameters:
+  arch.n_layers:
+    values: [1, 2, 3, 4]
+
+command:
+  - ${env}
+  - python
+  - train_sweep.py
+  - epochs=2
+  - arch=transformers_baseline
+  - wandb.group=base_ablation

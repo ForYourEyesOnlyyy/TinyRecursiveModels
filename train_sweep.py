@@ -71,13 +71,62 @@ class TrainConfig(pydantic.BaseModel):
     # Logging
     wandb: dict[str, Any] = {}
 
-def load_synced_config(hydra_cfg: DictConfig) -> TrainConfig:
-    """
-    Convert Hydra DictConfig into a validated PretrainConfig, and fill in
-    reasonable defaults for project_name, run_name, checkpoint_dir, save_every.
-    """
+def build_cfg_from_hydra(hydra_cfg: DictConfig) -> TrainConfig:
+    """Hydra DictConfig -> TrainConfig"""
     cfg_dict = OmegaConf.to_container(hydra_cfg, resolve=True)
-    cfg = TrainConfig(**cfg_dict)
+    return TrainConfig(**cfg_dict)
+
+def fold_arch_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Fold flat keys of the form "arch.<subkey>" into cfg["arch"][<subkey>].
+
+    For example:
+        {
+            "arch": {
+                "name": "...",
+                "n_layers": 6
+            },
+            "arch.n_layers": 3,
+            "arch.recursion_steps": 2,
+            "epochs": 2,
+        }
+
+    becomes:
+        {
+            "arch": {
+                "name": "...",
+                "n_layers": 3,
+                "recursion_steps": 2
+            },
+            "epochs": 2
+        }
+
+    Any top-level keys starting with "arch." are removed after being folded
+    into cfg["arch"].
+    """
+    # Ensure we have a dict for arch
+    arch = cfg.get("arch")
+    if arch is None:
+        arch = {}
+    elif not isinstance(arch, dict):
+        # If arch is not a dict (e.g. a string repr), reset it to empty and
+        # let arch.* keys repopulate it.
+        arch = {}
+
+    # Find all keys at top level that start with "arch."
+    arch_prefix_keys = [key for key in list(cfg.keys()) if key.startswith("arch.")]
+
+    for key in arch_prefix_keys:
+        _, subkey = key.split(".", 1)  # "arch.n_layers" -> "n_layers"
+        arch[subkey] = cfg.pop(key) 
+
+    cfg["arch"] = arch
+    return cfg
+
+def load_synced_config(cfg: TrainConfig) -> TrainConfig:
+    """
+    fill in reasonable defaults for project_name, run_name, checkpoint_dir, save_every.
+    """
 
     # project_name
     if cfg.project_name is None:
@@ -87,10 +136,8 @@ def load_synced_config(hydra_cfg: DictConfig) -> TrainConfig:
         cfg.project_name = proj
 
     # run_name
-
-    # for make meaningfull names if not given
-    if not hasattr(cfg, "run_name") or cfg.run_name is None:
-        cfg.run_name = build_run_name(cfg)
+    # <SWEEP ONLY!!!> overwrite given name
+    cfg.run_name = build_run_name(cfg)
 
     # checkpoint_dir
     if cfg.checkpoint_dir is None:
@@ -452,9 +499,9 @@ def evaluate(
 
 @hydra.main(config_path="config", config_name="cfg_pretrain_baseline", version_base=None)
 def main(hydra_cfg: DictConfig):
-    print(dict(hydra_cfg))
+
     # Convert & validate once
-    cfg = load_synced_config(hydra_cfg)
+    cfg = load_synced_config(build_cfg_from_hydra(hydra_cfg))
 
     set_seed(cfg.seed)
     device = get_device(cfg)
@@ -479,12 +526,18 @@ def main(hydra_cfg: DictConfig):
     if use_wandb:
         wandb.init(
             project=cfg.wandb.get("project", "baseline"),
-            name=getattr(cfg, "run_name", "run"),
-            group = cfg.wandb.get("group", "sandbox"),
+            name="default",
+            group=cfg.wandb.get("group", "sandbox"),
             mode=cfg.wandb.get("mode", "online"),
-            config=cfg.model_dump(),
-            tags=build_arch_tags(cfg),
+            config=cfg.model_dump()
         )
+        cfg_dict = fold_arch_overrides(dict(wandb.config))
+        cfg = load_synced_config(TrainConfig(**cfg_dict))  # merged Hydra + sweep
+
+        # update metadata after sweep overwrite
+        wandb.run.name = cfg.run_name
+        wandb.run.tags = build_arch_tags(cfg)
+
         wandb.watch(model)
         print(f"[W&B] Logging enabled — run: {wandb.run.name if wandb.run else 'None'}")
     else:
