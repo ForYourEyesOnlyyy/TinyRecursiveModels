@@ -2,9 +2,9 @@ import torch, torch.nn as nn, torch.nn.functional as F
 from typing import List, Dict, Tuple, Optional
 from pydantic import BaseModel, ValidationError
 
-IGNORE_LABEL_ID = -100  # if used by losmodels/recursive_reasoning/transformers_baseline.pyses
+IGNORE_LABEL_ID = -1
 
-class SudokuTransformerConfig(BaseModel):
+class BasicTransformerConfig(BaseModel):
     # data / vocab
     seq_len: int                    # 81 for Sudoku
     vocab_size: int                 # 11: {0=PAD, 1=blank, 2..10=digits 1..9}
@@ -17,7 +17,7 @@ class SudokuTransformerConfig(BaseModel):
     dropout: float = 0.1
 
 
-class SudokuTransformer(nn.Module):
+class BasicTransformer(nn.Module):
     """
     Plain encoder-only Transformer for Sudoku (or any token sequence).
     Forward signature: logits = model(inputs)
@@ -29,9 +29,9 @@ class SudokuTransformer(nn.Module):
     def __init__(self, cfg: Dict):
         super().__init__()
         try:
-            self.cfg = SudokuTransformerConfig(**cfg)
+            self.cfg = BasicTransformerConfig(**cfg)
         except ValidationError as e:
-            raise ValueError(f"[SudokuTransformerConfig] bad config: {e}") from e
+            raise ValueError(f"[BasicTransformer] bad config: {e}") from e
         
         d_model = self.cfg.hidden_size
         d_ff = int(self.cfg.expansion * d_model)
@@ -61,7 +61,7 @@ class SudokuTransformer(nn.Module):
             inputs = inputs.to(param_device)
 
         B, L = inputs.shape
-        assert L == self.cfg.seq_len, f"expected seq_len={self.cfg.seq_len}, got {L}"
+        assert L == self.cfg.seq_len, f"[BasicTransformer] expected seq_len={self.cfg.seq_len}, got {L}"
 
         pos = torch.arange(L, device=inputs.device).unsqueeze(0).expand(B, L)
         h = self.token_emb(inputs) + self.pos_emb(pos)

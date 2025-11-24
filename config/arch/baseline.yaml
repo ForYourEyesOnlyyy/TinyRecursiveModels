@@ -1,5 +1,5 @@
 # ---------- model wiring ----------
-name: recursive_reasoning.transformers_baseline@SudokuTransformer
+name: plain_reasoning.baseline@BasicTransformer
 
 # ---------- backbone ----------
 hidden_size: 512

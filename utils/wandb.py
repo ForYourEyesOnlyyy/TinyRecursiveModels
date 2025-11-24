@@ -25,7 +25,7 @@ def build_run_name(cfg: Any) -> str:
         arch_class = None
 
     # ---------- Baseline Transformer ----------
-    if arch_class == "SudokuTransformer":
+    if arch_class == "BasicTransformer":
         parts.append("Baseline")
         n_layers = getattr(cfg.arch, "n_layers", None)
         if n_layers is not None:
