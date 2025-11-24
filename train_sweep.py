@@ -497,7 +497,7 @@ def evaluate(
 
 # ---hyra---
 
-@hydra.main(config_path="config", config_name="cfg_pretrain_baseline", version_base=None)
+@hydra.main(config_path="config", config_name="cfg_pretrain", version_base=None)
 def main(hydra_cfg: DictConfig):
 
     # Convert & validate once
