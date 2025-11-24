@@ -31,8 +31,8 @@ def build_run_name(cfg: Any) -> str:
         if n_layers is not None:
             parts.append(f"L{n_layers}")
 
-    # ---------- Recursive Transformer ----------
-    elif arch_class == "HRecTransformer":
+    # ---------- H-only Recursive Transformer ----------
+    elif arch_class == "HRec":
         parts.append("HRec")
         n_layers = getattr(cfg.arch, "n_layers", None)
         rec_steps = getattr(cfg.arch, "recursion_steps", None)

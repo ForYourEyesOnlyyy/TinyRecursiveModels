@@ -9,7 +9,7 @@ from pydantic import BaseModel, ValidationError
 IGNORE_LABEL_ID = -100  
 
 
-class HRecTransformerConfig(BaseModel): 
+class HRecConfig(BaseModel): 
     # data / vocab
     seq_len: int                    # 81 for Sudoku
     vocab_size: int                 # 11: {0=PAD, 1=blank, 2..10=digits 1..9}
@@ -29,7 +29,7 @@ class HRecTransformerConfig(BaseModel):
     state_scale_init: float = 0.1   # initial scale to add to input embed
 
 
-class HRecTransformer(nn.Module):
+class HRec(nn.Module):
     """
     H-only recurrence:
       - tokens are fixed
@@ -45,9 +45,9 @@ class HRecTransformer(nn.Module):
     def __init__(self, cfg: Dict):
         super().__init__()
         try:
-            self.cfg = HRecTransformerConfig(**cfg)
+            self.cfg = HRecConfig(**cfg)
         except ValidationError as e:
-            raise ValueError(f"[HRecTransformer] bad config: {e}") from e
+            raise ValueError(f"[HRec] bad config: {e}") from e
 
         # copy/paste from baseline
         d_model = self.cfg.hidden_size
@@ -91,7 +91,7 @@ class HRecTransformer(nn.Module):
             inputs = inputs.to(param_device)
 
         B, L = inputs.shape
-        assert L == self.cfg.seq_len, f"expected seq_len={self.cfg.seq_len}, got {L}"
+        assert L == self.cfg.seq_len, f"[HRec] expected seq_len={self.cfg.seq_len}, got {L}"
         pos = torch.arange(L, device=inputs.device).unsqueeze(0).expand(B, L)
 
         # new stuff

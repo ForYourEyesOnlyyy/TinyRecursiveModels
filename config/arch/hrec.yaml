@@ -1,5 +1,5 @@
 # ---------- model wiring ----------
-name: recursive_reasoning.recurrent_transformer@HRecTransformer
+name: recursive_reasoning.single_cycle@HRec
 
 # ---------- backbone ----------
 hidden_size: 512
