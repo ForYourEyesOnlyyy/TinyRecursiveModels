@@ -145,6 +145,10 @@ def build_model_from_cfg(cfg: TrainConfig, metadata, device: torch.device) -> nn
 
     model = model_cls(model_cfg_dict).to(device)
     print(f"[model] Loaded model: {cfg.arch.name}")
+
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[model] Trainable params: {trainable_params}")
+    
     return model
 
 
@@ -452,7 +456,6 @@ def evaluate(
 
 @hydra.main(config_path="config", config_name="cfg_pretrain", version_base=None)
 def main(hydra_cfg: DictConfig):
-    print(dict(hydra_cfg))
     # Convert & validate once
     cfg = load_synced_config(hydra_cfg)
 

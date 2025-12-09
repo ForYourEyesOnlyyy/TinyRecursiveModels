@@ -141,9 +141,3 @@ class TRM(nn.Module):
                     logits_steps.append(logits_t.detach())
         final_logits = logits_steps[-1] if logits_steps else logits_t
         return final_logits, (logits_steps if return_all_logits else None)
-
-                    
-
-
-
-
