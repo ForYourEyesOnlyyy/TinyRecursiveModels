@@ -6,10 +6,10 @@ hidden_size: 512
 num_heads: 8
 expansion: 4
 dropout: 0.1
-n_layers: 6
+n_layers: 2
 
 # ---------- recursion ----------
-H_cycles: 1           
+H_cycles: 3           
 L_cycles: 3            
 detach_till_last: True   # run with no grads until the last step
 deep_supervision: False   # we average loss across all recursion steps 

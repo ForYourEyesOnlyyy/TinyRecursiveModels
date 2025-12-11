@@ -1,0 +1,67 @@
+# ===========================
+# Job metadata
+# ===========================
+name: sudoku-trm-train
+desc: Train TRM on Sudoku Extreme using Hydra configs + W&B logging
+
+# ===========================
+# Command to run
+# ===========================
+cmd: >
+  python3 train_job.py
+    arch=trm
+    data_paths="['data/sudoku-extreme-1k-aug-1000']"
+    epochs=3
+    eval_interval=20
+    lr=1e-3
+    weight_decay=0.1
+    global_batch_size=128
+    wandb.group="sandbox"
+
+# ===========================
+# Inputs: files / directories
+# ===========================
+inputs:
+  # Hydra configs
+  - config/cfg_pretrain.yaml
+  - config/arch/trm.yaml
+
+  # Dataset directory (must exist in your project disk)
+  - data/sudoku-extreme-1k-aug-1000
+
+# ===========================
+# Outputs (checkpoint directory)
+# ===========================
+outputs:
+  - checkpoints: CHECKPOINT_DIR
+
+# ===========================
+# Environment (docker, vars, secrets)
+# ===========================
+env:
+  python: auto
+  vars:
+    - PYTHONUNBUFFERED: "1"
+    - WANDB_SECRET_KEY
+    - WANDB__DISABLE_INTEGRATIONS: "true"
+
+# ===========================
+# Mount project disk
+# ===========================
+flags:
+  - attach-project-disk
+
+# ===========================
+# Compute resources
+# ===========================
+cloud-instance-types:
+  - g2.1
+
+# ===========================
+# Graceful shutdown (optional)
+# ===========================
+graceful-shutdown:
+  signal: SIGTERM
+  timeout: 20s
+
+python_root_modules: [] 
