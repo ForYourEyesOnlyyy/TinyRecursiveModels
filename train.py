@@ -333,14 +333,14 @@ def train_one_epoch(
 
 
         if deep_supervision and logits_steps:
-            losses = [
+            step_losses = [
                 F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     labels.view(-1),
                     ignore_index=IGNORE_LABEL_ID
                 ) for logits in logits_steps
             ]
-            loss = sum(losses) / len(losses)
+            loss = sum(step_losses) / len(step_losses)
         else:
             loss = F.cross_entropy(
                 final_logits.view(-1, final_logits.size(-1)),
@@ -419,14 +419,14 @@ def evaluate(
 
 
         if deep_supervision and logits_steps:
-            losses = [
+            step_losses = [
                 F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     labels.view(-1),
                     ignore_index=IGNORE_LABEL_ID
                 ) for logits in logits_steps
             ]
-            loss = sum(losses) / len(losses)
+            loss = sum(step_losses) / len(step_losses)
         else:
             loss = F.cross_entropy(
                 final_logits.view(-1, final_logits.size(-1)),
@@ -448,8 +448,13 @@ def evaluate(
         })
 
     bar.close()
-    n = max(1, len(losses))
-    return sum(losses) / n, sum(acc_alls) / n, sum(acc_blanks) / n
+    num_batches = max(1, len(acc_blanks))
+
+    avg_loss = sum(losses) / num_batches
+    avg_acc_all = sum(acc_alls) / num_batches
+    avg_acc_blank = sum(acc_blanks) / num_batches
+
+    return avg_loss, avg_acc_all, avg_acc_blank
 
 
 # ---hyra---

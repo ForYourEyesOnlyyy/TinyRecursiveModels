@@ -51,6 +51,21 @@ def build_run_name(cfg: Any) -> str:
         if ru is not None:
             parts.append(f"RU={ru}")
 
+    elif arch_class == "TRM":
+        parts.append("TRM")
+        n_layers = getattr(cfg.arch, "n_layers", None)
+        H_cycles = getattr(cfg.arch, "H_cycles", None)
+        L_cycles = getattr(cfg.arch, "L_cycles", None)
+        tbptt = getattr(cfg.arch, "detach_till_last", None)
+        if H_cycles is not None:
+            parts.append(f"H{H_cycles}")
+        if L_cycles is not None:
+            parts.append(f"L{L_cycles}")
+        if n_layers is not None:
+            parts.append(f"B{n_layers}")
+        if tbptt is not None:
+            parts.append(f"TBPTT={tbptt}")
+
     # ---------- Unknown Arch ----------
     else:
         parts.append("UNK_ARCH")
@@ -81,6 +96,8 @@ def build_arch_tags(cfg) -> list[str]:
 
     # Optional fields — may not exist for baseline models
     n_layers  = getattr(cfg.arch, "n_layers", None)
+    H_cycles = getattr(cfg.arch, "H_cycles", None)
+    L_cycles = getattr(cfg.arch, "L_cycles", None)
     rec_steps = getattr(cfg.arch, "recursion_steps", None)
     tbptt     = getattr(cfg.arch, "detach_till_last", None)
     ds        = getattr(cfg.arch, "deep_supervision", None)
@@ -89,7 +106,13 @@ def build_arch_tags(cfg) -> list[str]:
     tags = [base_name]
 
     if n_layers is not None:
-        tags.append(f"L={n_layers}")
+        tags.append(f"Backbone={n_layers}")
+
+    if H_cycles is not None:
+        tags.append(f"H_cycles={H_cycles}")
+
+    if L_cycles is not None:
+        tags.append(f"L_cycles={L_cycles}")
 
     if rec_steps is not None:
         tags.append(f"T={rec_steps}")
