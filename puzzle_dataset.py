@@ -6,12 +6,12 @@ import pydantic
 
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
-
-from models.losses import IGNORE_LABEL_ID
 from dataset.common import PuzzleDatasetMetadata
 
 from argdantic import ArgParser
 from pydantic import BaseModel
+
+IGNORE_LABEL_ID = -100
 
 def _sample_batch(rng: np.random.Generator, group_order: np.ndarray, puzzle_indices: np.ndarray, group_indices: np.ndarray, start_index: int, global_batch_size: int):
     # Pack examples into a full batch

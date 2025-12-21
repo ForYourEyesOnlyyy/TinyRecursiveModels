@@ -1,7 +1,7 @@
 python train.py \
   arch=trm \
   data_paths="[data/sudoku-extreme-1k-aug-1000]" \
-  epochs=3 \
+  epochs=5000 \
   eval_interval=20 \
   lr=1e-3 \
   weight_decay=0.1 \

@@ -1,5 +1,5 @@
 defaults:
-  - arch: hrec_transformer
+  - arch: trm
   - _self_
 
 project_name: sudoku_baseline
@@ -22,7 +22,7 @@ beta2: 0.95
 
 # training
 seed: 42
-epochs: 5000                       # total epochs
+epochs: 100                       # total epochs
 eval_interval: 100                 # evaluate every N epochs
 
 device: auto  # cpu | cuda | mps | auto

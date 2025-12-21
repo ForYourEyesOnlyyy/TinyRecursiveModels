@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig
 from utils.functions import load_model_class
 from utils.wandb import build_run_name, build_arch_tags
-from models.losses import IGNORE_LABEL_ID
+IGNORE_LABEL_ID = -100
 
 load_dotenv()
 
@@ -309,6 +309,7 @@ def train_one_epoch(
         step0: int,
         opt: torch.optim.Optimizer,
         use_wandb: bool,
+        logger: Any,
         position=1,                                # TQDM
         epoch: int = 0,                            # TQDM
         total_epochs: int = 1,                     # TQDM 
@@ -327,8 +328,8 @@ def train_one_epoch(
             )
     for set_name, batch, _ in bar:
         step += 1
-        inputs = batch['inputs'].to(device)
-        labels = batch['labels'].to(device)
+        inputs = batch['inputs'].to(device).long()
+        labels = batch['labels'].to(device).long()
 
 
         final_logits, logits_steps = model(inputs, return_all_logits=True)
@@ -372,8 +373,8 @@ def train_one_epoch(
         })
 
 
-        if use_wandb and wandb is not None:
-            wandb.log({
+        if use_wandb and logger is not None:
+            logger.log({
                 "train/loss_ce": loss.item(),
                 "train/acc_blank": acc_blank,
                 "train/acc_all": acc_all,
@@ -414,8 +415,8 @@ def evaluate(
                 dynamic_ncols=True
             )
     for set_name, batch, _ in bar:
-        inputs = batch['inputs'].to(device)
-        labels = batch['labels'].to(device)
+        inputs = batch['inputs'].to(device).long()
+        labels = batch['labels'].to(device).long()
 
         final_logits, logits_steps = model(inputs, return_all_logits=True)
 
@@ -488,12 +489,14 @@ def main(hydra_cfg: DictConfig):
 
     use_wandb = bool(getattr(cfg, "wandb", {}).get("enabled", False)) and (wandb is not None)
     if use_wandb:
-        wandb.login(key=os.environ["WANDB_SECRET_KEY"])
+        wandb.login(key=os.environ["WANDB_API_KEY"])
         wandb.init(
+            entity=cfg.wandb.get("entity", None),
             project=cfg.wandb.get("project", "baseline"),
             name=getattr(cfg, "run_name", "run"),
             group = cfg.wandb.get("group", "sandbox"),
-            mode=cfg.wandb.get("mode", "online"),
+            mode="offline",
+            dir="wdb_logs",
             config=cfg.model_dump(),
             tags=build_arch_tags(cfg),
         )
@@ -535,6 +538,7 @@ def main(hydra_cfg: DictConfig):
             step0=step,
             opt=opt,
             use_wandb=use_wandb,
+            logger=wandb,
             position=1,
             epoch=epoch,
             total_epochs=cfg.epochs,
