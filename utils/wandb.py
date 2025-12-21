@@ -56,15 +56,15 @@ def build_run_name(cfg: Any) -> str:
         n_layers = getattr(cfg.arch, "n_layers", None)
         H_cycles = getattr(cfg.arch, "H_cycles", None)
         L_cycles = getattr(cfg.arch, "L_cycles", None)
-        tbptt = getattr(cfg.arch, "detach_till_last", None)
+        # tbptt = getattr(cfg.arch, "detach_till_last", None)
         if H_cycles is not None:
             parts.append(f"H{H_cycles}")
         if L_cycles is not None:
             parts.append(f"L{L_cycles}")
         if n_layers is not None:
             parts.append(f"B{n_layers}")
-        if tbptt is not None:
-            parts.append(f"TBPTT={tbptt}")
+        # if tbptt is not None:
+        #     parts.append(f"TBPTT={tbptt}")
 
     # ---------- Unknown Arch ----------
     else:

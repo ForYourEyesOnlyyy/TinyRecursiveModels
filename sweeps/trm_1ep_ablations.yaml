@@ -1,0 +1,30 @@
+program: train.py
+method: grid
+
+project: sudoku_baseline
+
+metric:
+  name: eval/acc_blank
+  goal: maximize
+
+parameters:
+  arch.n_layers:
+    values: [3, 6]
+
+  arch.H_cycles:
+    values: [1, 3]
+
+  arch.L_cycles:
+    values: [1, 3, 6]
+
+command:
+  - ${env}
+  - python
+  - train_sweep.py
+  - arch=trm
+  - epochs=3000
+  - global_batch_size=512
+  - eval_interval=20 
+  - lr=1e-3
+  - weight_decay=0.1
+  - wandb.group=trm_1ep_layer_ablations

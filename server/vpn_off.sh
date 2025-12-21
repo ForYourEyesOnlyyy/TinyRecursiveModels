@@ -1,0 +1,1 @@
+wg-quick down wg1

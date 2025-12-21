@@ -6,3 +6,4 @@ checkpoints/
 outputs/
 wandb/
 .env
+.venv

@@ -325,8 +325,8 @@ def train_one_epoch(
             )
     for set_name, batch, _ in bar:
         step += 1
-        inputs = batch['inputs'].to(device)
-        labels = batch['labels'].to(device)
+        inputs = batch['inputs'].to(device).long()
+        labels = batch['labels'].to(device).long()
 
 
         final_logits, logits_steps = model(inputs, return_all_logits=True)
@@ -412,8 +412,8 @@ def evaluate(
                 dynamic_ncols=True
             )
     for set_name, batch, _ in bar:
-        inputs = batch['inputs'].to(device)
-        labels = batch['labels'].to(device)
+        inputs = batch['inputs'].to(device).long()
+        labels = batch['labels'].to(device).long()
 
         final_logits, logits_steps = model(inputs, return_all_logits=True)
 
@@ -486,6 +486,7 @@ def main(hydra_cfg: DictConfig):
     use_wandb = bool(getattr(cfg, "wandb", {}).get("enabled", False)) and (wandb is not None)
     if use_wandb:
         wandb.init(
+            entity="mrtshv-innopolis-university",
             project=cfg.wandb.get("project", "baseline"),
             name=getattr(cfg, "run_name", "run"),
             group = cfg.wandb.get("group", "sandbox"),

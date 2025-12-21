@@ -1,0 +1,23 @@
+[Interface]
+Address = <tunnel>/32
+DNS = 1.1.1.1, 1.0.0.1
+PrivateKey = <PrivateKey>
+Table = 51820
+
+PostUp = iptables -t mangle -A OUTPUT -p tcp --sport 22 -j MARK --set-mark 1 || true
+PostUp = ip rule add priority 400 fwmark 1 lookup main || true
+PostUp = ip rule add priority 100 to <server>/32 lookup main || true
+PostUp = ip rule add priority 1000 lookup 51820 || true
+
+PostDown = ip rule del priority 1000 lookup 51820 || true
+PostDown = ip rule del priority 100 to <server>/32 lookup main || true
+PostDown = ip rule del priority 400 fwmark 1 lookup main || true
+PostDown = iptables -t mangle -D OUTPUT -p tcp --sport 22 -j MARK --set-mark 1 || true
+
+[Peer]
+PublicKey = <PublicKey>
+PresharedKey = <PresharedKey>
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = <server>:<port>
+PersistentKeepalive = 25
+
