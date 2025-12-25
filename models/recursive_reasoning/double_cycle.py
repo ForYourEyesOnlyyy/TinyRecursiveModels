@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 
 import torch
@@ -8,6 +9,11 @@ from pydantic import BaseModel, ValidationError
 
 IGNORE_LABEL_ID = -100  
 
+@dataclass
+class TRMCarry:
+    """Recurrent hidden state carried across reasoning episodes."""
+    Z_S: torch.Tensor   # Solution latent (slow state)
+    Z_R: torch.Tensor   # Reasoning latent (fast state)
 
 class TRMConfig(BaseModel): 
     # data / vocab
@@ -22,8 +28,8 @@ class TRMConfig(BaseModel):
     dropout: float = 0.1
 
     # recursion
-    H_cycles: int            # Number of recursion cycles (deep recursion steps - H cycles)
-    L_cycles: int            # Number of reasoning cycles (latent recursion steps - L cycles)
+    S_steps: int            # Number of solution recursion cycles (deep recursion steps - H cycles(legacy))
+    R_steps: int            # Number of reasoning cycles (latent recursion steps - L cycles (legacy))
     detach_till_last: bool = True        # If True then we do no grad unlit H - 1 steps
     deep_supervision: bool = False       # If True, then we average CE loss across steps
     # residual_update: bool = True       # z_H <- z_H + ΔH   (otherwise z_H <- ΔH)
@@ -54,8 +60,10 @@ class TRMBlock(nn.Module):
 
 class TRM(nn.Module):
     """
-    TRM High and low frequency recurrence:
-    #TODO
+    TRM model (no ACT here):
+      - Two latents: reasoning state - Z_R (fast) and solution state Z_S (slow)
+      - One shared tiny net (L_level) updates both states
+      - Can be used in multi-episode training via TRMCarry
     """
 
     def __init__(self, cfg: Dict):
@@ -78,26 +86,41 @@ class TRM(nn.Module):
         # Classification head
         self.head = nn.Linear(d_model, self.cfg.vocab_size)
 
-        # State scales
-        self.alpha_L = nn.Parameter(torch.full((), self.cfg.state_scale_init)) if self.cfg.scale_input_injection else 1
-        self.alpha_H = nn.Parameter(torch.full((), self.cfg.state_scale_init)) if self.cfg.scale_input_injection else 1
+        # optional learnable gates for injection
+        self.alpha_R = nn.Parameter(torch.full((), self.cfg.state_scale_init)) if self.cfg.scale_input_injection else 1
+        self.alpha_S = nn.Parameter(torch.full((), self.cfg.state_scale_init)) if self.cfg.scale_input_injection else 1
 
-        # State init
-        self.ZL_init = nn.Parameter(torch.zeros(1, self.cfg.seq_len, d_model), requires_grad=False)
-        self.ZH_init = nn.Parameter(torch.zeros(1, self.cfg.seq_len, d_model), requires_grad=False)
+        # state init buffers (non-trainable by default)
+        self.ZR_init = nn.Parameter(torch.zeros(1, self.cfg.seq_len, d_model), requires_grad=False)
+        self.ZS_init = nn.Parameter(torch.zeros(1, self.cfg.seq_len, d_model), requires_grad=False)
 
+    def init_carry(self, batch_size: int, device: torch.device) -> TRMCarry:
+        """Initialize Z_H and Z_L for a new puzzle episode."""
+        Z_R = self.ZR_init.expand(batch_size, self.cfg.seq_len, -1).clone().to(device)
+        Z_S = self.ZS_init.expand(batch_size, self.cfg.seq_len, -1).clone().to(device)
+        return TRMCarry(Z_S=Z_S, Z_R=Z_R)
+
+    def _base_embedding(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Token + positional embedding."""
+        B, L = inputs.shape
+        pos = torch.arange(L, device=inputs.device).unsqueeze(0).expand(B, L)
+        return self.token_emb(inputs) + self.pos_emb(pos)
 
     def forward(
             self, 
             inputs: torch.Tensor, 
-            *, 
+            carry: TRMCarry,
+            *,
             return_all_logits: bool = True
             ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
         """
-        inputs: [B, L] long token ids
-        return:
-          - final_logits: [B, L, V]
-          - logits_steps: Optional[List[[B, L, V]]] if return_all_logits=True
+        One TRM reasoning episode:
+          - runs S_steps outer updates and R_steps inner updates
+          - updates carry (Z_S, Z_R)
+          - returns final logits and optionally logits from intermediate solution steps
+
+        Returns:
+          new_carry, final_logits, logits_steps (optional)
         """
 
         param_device = next(self.parameters()).device
@@ -107,37 +130,32 @@ class TRM(nn.Module):
         B, L = inputs.shape
         assert L == self.cfg.seq_len, f"[TRM] expected seq_len={self.cfg.seq_len}, got {L}"
 
-        # Base embedding (tokens + positional)
-        pos = torch.arange(L, device=inputs.device).unsqueeze(0).expand(B, L)
-        base_emb = self.token_emb(inputs) + self.pos_emb(pos)
-
-        # Inital states
-        Z_L = self.ZL_init.expand(B, L, -1).clone()
-        Z_H = self.ZH_init.expand(B, L, -1).clone()
-
+        x_embed = self._base_embedding(inputs)
+        Z_R = carry.Z_R
+        Z_S = carry.Z_S
         logits_steps: List[torch.Tensor] = []
-        H = max(1, self.cfg.H_cycles)
-        L_inner = max(1, self.cfg.L_cycles)
+        solution_steps = max(1, self.cfg.S_steps)
+        reasoning_steps = max(1, self.cfg.R_steps)
 
-        for h_step in range(H):
+        for s_step in range(solution_steps):
             # TBPTT
-            ctx = torch.no_grad() if (self.cfg.detach_till_last and h_step < H - 1) else nullcontext()
+            ctx = torch.no_grad() if (self.cfg.detach_till_last and s_step < solution_steps - 1) else nullcontext()
 
             with ctx:
-                # inner L cycles (latent recursion)
-                for _ in range(L_inner):
-                    Z_L = self.backbone(Z_L, Z_H + self.alpha_L * base_emb)
+                # inner reasoning cycles (latent recursion)
+                for _ in range(reasoning_steps):
+                    Z_R = self.backbone(Z_R, Z_S + self.alpha_R * x_embed)
 
-                # outer H update (deep recursion)
-                Z_H = self.backbone(Z_H, self.alpha_H * Z_L)
+                # outer solution update (deep recursion)
+                Z_S = self.backbone(Z_S, self.alpha_S * Z_R)
 
-                logits_t = self.head(Z_H)
-
+                logits_t = self.head(Z_S)
 
             if return_all_logits:
-                if h_step == H - 1:
+                if s_step == solution_steps - 1:
                     logits_steps.append(logits_t)
                 elif self.cfg.deep_supervision:
                     logits_steps.append(logits_t.detach())
         final_logits = logits_steps[-1] if logits_steps else logits_t
-        return final_logits, (logits_steps if return_all_logits else None)
+        new_carry = TRMCarry(Z_S=Z_S, Z_R=Z_R)
+        return new_carry, final_logits, (logits_steps if return_all_logits else None)

@@ -292,12 +292,53 @@ def global_accuracy(logits: torch.Tensor, labels: torch.Tensor, ignore_index=0):
 
 # ---training---
 
+def train_one_episode(
+    model: nn.Module,
+    inputs: torch.Tensor,
+    labels: torch.Tensor,
+    carry,
+    opt: torch.optim.Optimizer,
+    *,
+    blank_id: int,
+) -> tuple:
+    # Forward one reasoning episode
+    carry, final_logits, _ = model(
+        inputs,
+        carry,
+        return_all_logits=False,
+    )
+
+    # Compute loss
+    loss = F.cross_entropy(
+        final_logits.view(-1, final_logits.size(-1)),
+        labels.view(-1),
+        ignore_index=IGNORE_LABEL_ID,
+    )
+
+    # Backward + update
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step()
+
+    # Metrics (from final episode only)
+    acc_blank = blank_accuracy(final_logits, labels, inputs, blank_id=blank_id)
+    acc_all = global_accuracy(final_logits, labels)
+
+    # Detach carry between episodes (TBPTT across episodes)
+    carry = type(carry)(
+        Z_S=carry.Z_S.detach(),
+        Z_R=carry.Z_R.detach(),
+    )
+
+    return carry, float(loss.item()), acc_blank, acc_all
 
 def train_one_epoch(
         model: nn.Module,
         loader: DataLoader,
         device: torch.device,
         *,
+        episodes: int,
         deep_supervision: bool,
         blank_id: int,
         base_lr: float,
@@ -314,6 +355,8 @@ def train_one_epoch(
         ) -> int:
     model.train()
     step = step0
+    delta_blank_list: List[float] = []
+    delta_all_list: List[float] = []
     
     bar = tqdm(
                 loader, 
@@ -359,26 +402,66 @@ def train_one_epoch(
         for pg in opt.param_groups:
             pg["lr"] = lr_now
 
-        # metrics and logging
-        acc_blank = blank_accuracy(final_logits, labels, inputs, blank_id=blank_id)
-        acc_all   = global_accuracy(final_logits, labels)
+        for ep in range(episodes):
+            carry, loss, acc_blank, acc_all = train_one_episode(
+            model,
+            inputs,
+            labels,
+            carry,
+            opt,
+            blank_id=blank_id,
+            )
+
+            if ep == 0:
+                first_acc_blank = acc_blank
+                first_acc_all = acc_all
+
+            if ep == episodes - 1:
+                last_acc_blank = acc_blank
+                last_acc_all = acc_all
+                last_loss_value = loss
+
+
+        delta_blank = 0.0
+        delta_all = 0.0
+        if first_acc_blank is not None and last_acc_blank is not None:
+            delta_blank = float(last_acc_blank - first_acc_blank)
+            delta_all = float(last_acc_all - first_acc_all)
+            delta_blank_list.append(delta_blank)
+            delta_all_list.append(delta_all)
 
         bar.set_postfix({
-            "loss": f"{loss.item():.4f}",
-            "blank_acc": f"{acc_blank:.3f}",
-            "all_acc": f"{acc_all:.3f}"
+            "loss": f"{(last_loss_value or 0.0):.4f}",
+            "blank_acc": f"{(last_acc_blank or 0.0):.3f}",
+            "all_acc": f"{(last_acc_all or 0.0):.3f}",
+            "Δblank": f"{delta_blank:+.3f}",
         })
 
 
         if use_wandb and wandb is not None:
             wandb.log({
-                "train/loss_ce": loss.item(),
-                "train/acc_blank": acc_blank,
-                "train/acc_all": acc_all,
-                "lr": lr_now,
-                "step": step
+                "train/loss_ce": last_loss_value,
+                "train/acc_blank": last_acc_blank,
+                "train/acc_all": last_acc_all,
+                "train/delta_blank_acc": delta_blank,
+                # "train/delta_all_acc": delta_all,
+                # "train/episodes": episodes,
+                "step": step,
+                "epoch": epoch + 1,
             })
     bar.close()
+
+    if use_wandb and wandb is not None:
+        avg_delta_blank = sum(delta_blank_list) / max(1, len(delta_blank_list))
+        avg_delta_all = sum(delta_all_list) / max(1, len(delta_all_list))
+
+        wandb.log({
+            "reasoning_effectiveness/avg_delta_blank_acc": avg_delta_blank,
+            # "reasoning_effectiveness/avg_delta_all_acc": avg_delta_all,
+            # "reasoning_effectiveness/episodes": episodes,
+            "epoch": epoch + 1,
+        })
+
     return step
 
 @torch.no_grad()
@@ -387,20 +470,20 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     *,
-    deep_supervision: bool,
+    episodes_eval: int,
     blank_id: int,
     max_batches: int | None = None,
-    position=2,                         # TQDM
-    epoch: int = 1,                     # TQDM 
-    total_epochs: int = 1,              # TQDM
-    ) -> Tuple[float, float, float]:
-
-    # sanity check
-    if loader is None:
-        return 0.0, 0.0, 0.0
-    
+    position: int = 2,
+    epoch: int = 0,
+    total_epochs: int = 1,
+) -> tuple[float, float, float, float, float]:
     model.eval()
-    losses, acc_blanks, acc_alls = [], [], []
+
+    losses = []
+    acc_all_final = []
+    acc_blank_final = []
+    delta_blank_list = []
+    delta_all_list = []
 
     iterable = loader if max_batches is None else islice(loader, max_batches)
     bar = tqdm(
@@ -415,46 +498,58 @@ def evaluate(
         inputs = batch['inputs'].to(device).long()
         labels = batch['labels'].to(device).long()
 
-        final_logits, logits_steps = model(inputs, return_all_logits=True)
+        carry = model.init_carry(inputs.shape[0], device)
 
+        first_acc_blank = None
+        first_acc_all = None
+        last_logits = None
 
-        if deep_supervision and logits_steps:
-            step_losses = [
-                F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    labels.view(-1),
-                    ignore_index=IGNORE_LABEL_ID
-                ) for logits in logits_steps
-            ]
-            loss = sum(step_losses) / len(step_losses)
-        else:
-            loss = F.cross_entropy(
-                final_logits.view(-1, final_logits.size(-1)),
-                labels.view(-1),
-                ignore_index=IGNORE_LABEL_ID
-            )
-        
-        # metrics and logging
-        losses.append(loss.item())
-        acc_b = blank_accuracy(final_logits, labels, inputs, blank_id=blank_id)
-        acc_a = global_accuracy(final_logits, labels)
-        acc_blanks.append(acc_b)
-        acc_alls.append(acc_a)
+        for ep in range(max(1, episodes_eval)):
+            carry, logits, _ = model.forward(inputs, carry, return_all_logits=False)
+            last_logits = logits
+
+            acc_b = blank_accuracy(logits, labels, inputs, blank_id=blank_id)
+            acc_a = global_accuracy(logits, labels)
+
+            if ep == 0:
+                first_acc_blank = acc_b
+                first_acc_all = acc_a
+
+        # final loss/acc on last episode
+        loss = F.cross_entropy(
+            last_logits.view(-1, last_logits.size(-1)),
+            labels.view(-1),
+            ignore_index=IGNORE_LABEL_ID,
+        ).item()
+
+        final_acc_b = blank_accuracy(last_logits, labels, inputs, blank_id=blank_id)
+        final_acc_a = global_accuracy(last_logits, labels)
+
+        losses.append(loss)
+        acc_blank_final.append(final_acc_b)
+        acc_all_final.append(final_acc_a)
+
+        # delta: last - first
+        if first_acc_blank is not None:
+            delta_blank_list.append(float(final_acc_b - first_acc_blank))
+            delta_all_list.append(float(final_acc_a - first_acc_all))
 
         bar.set_postfix({
-            "loss": f"{loss.item():.4f}",
-            "blank_acc": f"{acc_b:.3f}",
-            "all_acc": f"{acc_a:.3f}"
+            "loss": f"{loss:.4f}",
+            "blank_acc": f"{final_acc_b:.3f}",
+            "Δblank": f"{(delta_blank_list[-1] if delta_blank_list else 0.0):+.3f}",
         })
 
     bar.close()
-    num_batches = max(1, len(acc_blanks))
 
-    avg_loss = sum(losses) / num_batches
-    avg_acc_all = sum(acc_alls) / num_batches
-    avg_acc_blank = sum(acc_blanks) / num_batches
+    n = max(1, len(losses))
+    avg_loss = sum(losses) / n
+    avg_acc_all = sum(acc_all_final) / n
+    avg_acc_blank = sum(acc_blank_final) / n
 
-    return avg_loss, avg_acc_all, avg_acc_blank
+    avg_delta_blank = sum(delta_blank_list) / max(1, len(delta_blank_list))
+
+    return avg_loss, avg_acc_all, avg_acc_blank, avg_delta_blank
 
 
 # ---hyra---
@@ -523,6 +618,7 @@ def main(hydra_cfg: DictConfig):
     for epoch in master_bar:
         step = train_one_epoch(
             model, train_loader, device,
+            episodes=cfg.n_reasoning_episodes,
             deep_supervision=deep_supervision,
             blank_id=blank_id,
             base_lr=cfg.lr,
@@ -539,9 +635,10 @@ def main(hydra_cfg: DictConfig):
         )
         # eval periodically to speedup runtime
         if (epoch + 1) % max(1, cfg.eval_interval) == 0 and eval_loader is not None:
-            eval_loss, eval_acc_all, eval_acc_blank = evaluate(
+            eval_loss, eval_acc_all, eval_acc_blank, eval_reasoning_effect = evaluate(
                 model, eval_loader, device, 
-                deep_supervision=deep_supervision, 
+                episodes_eval=cfg.n_reasoning_episodes,
+                # deep_supervision=deep_supervision, 
                 blank_id=blank_id, 
                 max_batches=cfg.max_eval_batches, 
                 position=2,
@@ -553,12 +650,14 @@ def main(hydra_cfg: DictConfig):
                     "eval/loss_ce": eval_loss,
                     "eval/acc_all": eval_acc_all,
                     "eval/acc_blank": eval_acc_blank,
+                    "eval/reasoning_effectivenes": eval_reasoning_effect,
                     "epoch": epoch + 1
                 })
             master_bar.set_postfix({
             "eval_epoch": f"{epoch+1}/{cfg.epochs}",
             "eval_loss": f"{eval_loss:.4f}",
-            "eval_blank_acc": f"{eval_acc_blank:.3f}"
+            "eval_blank_acc": f"{eval_acc_blank:.3f}",
+            "eval_episode_delta": f"{eval_reasoning_effect:.3f}"
             })
 
             # save best

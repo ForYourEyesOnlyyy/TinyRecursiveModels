@@ -6,4 +6,8 @@ checkpoints/
 outputs/
 wandb/
 .env
+<<<<<<< Updated upstream
 .venv
+=======
+wdb_job/
+>>>>>>> Stashed changes
