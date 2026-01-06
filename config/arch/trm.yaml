@@ -6,11 +6,11 @@ hidden_size: 512
 num_heads: 8
 expansion: 4
 dropout: 0.1
-n_layers: 2
+n_layers: 1
 
 # ---------- recursion ----------
-S_steps: 3           
-R_steps: 3            
+S_steps: 1           
+R_steps: 1           
 detach_till_last: True   # run with no grads until the last step
 deep_supervision: False   # we average loss across all recursion steps 
 # residual_update: False    # add a residual for recursive latent 

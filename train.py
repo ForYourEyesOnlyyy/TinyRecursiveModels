@@ -179,6 +179,9 @@ def save_checkpoint(path: str, model, opt, epoch: int, step: int, cfg: TrainConf
         "rng_python": random.getstate(),
         "rng_numpy": np.random.get_state(),
         "rng_torch": torch.random.get_rng_state(),
+
+        # wandb
+        "wandb_run_id": wandb.run.id if wandb.run else None,
     }
     if torch.cuda.is_available():
         ckpt["rng_torch_cuda"] = torch.cuda.get_rng_state_all()
@@ -190,7 +193,7 @@ def load_checkpoint(path: str, model, opt, device: torch.device):
         print(f"[checkpoint] no checkpoint at: {path}")
         return 0, 0, None
 
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     # model
     missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
     if hasattr(missing, "__len__"):
@@ -217,8 +220,9 @@ def load_checkpoint(path: str, model, opt, device: torch.device):
     epoch = int(ckpt.get("epoch", 0))
     step = int(ckpt.get("step", 0))
     best_score = ckpt.get("best_score", None)
-    print(f"[checkpoint] loaded: {path} (epoch={epoch}, step={step}, best={best_score})")
-    return epoch, step, best_score
+    wandb_run_id = ckpt.get("wandb_run_id", None)
+    print(f"[checkpoint] loaded: {path} (epoch={epoch}, step={step}, best={best_score}, id={wandb_run_id})")
+    return epoch, step, best_score, wandb_run_id
 
 def get_device(cfg: TrainConfig) -> torch.device:
     if cfg.device == "cuda" and torch.cuda.is_available():
@@ -359,6 +363,10 @@ def train_one_epoch(
     delta_all_list: List[float] = []
     
     bar = tqdm(
+
+
+
+        
                 loader, 
                 desc=f"Train ({epoch+1}/{total_epochs})",
                 total=total_train_batches,
@@ -368,35 +376,15 @@ def train_one_epoch(
             )
     for set_name, batch, _ in bar:
         step += 1
-        inputs = batch['inputs'].to(device).long()
-        labels = batch['labels'].to(device).long()
+        inputs = batch['inputs'].to(device)
+        labels = batch['labels'].to(device)
+        carry = model.init_carry(inputs.shape[0], device)
 
-
-        final_logits, logits_steps = model(inputs, return_all_logits=True)
-
-
-        if deep_supervision and logits_steps:
-            step_losses = [
-                F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    labels.view(-1),
-                    ignore_index=IGNORE_LABEL_ID
-                ) for logits in logits_steps
-            ]
-            loss = sum(step_losses) / len(step_losses)
-        else:
-            loss = F.cross_entropy(
-                final_logits.view(-1, final_logits.size(-1)),
-                labels.view(-1),
-                ignore_index=IGNORE_LABEL_ID
-            )
-
-
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
-
+        first_acc_blank = None
+        first_acc_all = None
+        last_acc_blank = None
+        last_acc_all = None
+        last_loss_value = None
         # schedule lr
         lr_now = cosine_warmup_lr(step, base_lr, warmup, total_steps, min_ratio)
         for pg in opt.param_groups:
@@ -487,16 +475,17 @@ def evaluate(
 
     iterable = loader if max_batches is None else islice(loader, max_batches)
     bar = tqdm(
-                iterable, 
-                desc=f"Eval ({epoch+1}/{total_epochs})", 
-                total=max_batches, 
-                position=position, 
-                leave=False, 
-                dynamic_ncols=True
-            )
-    for set_name, batch, _ in bar:
-        inputs = batch['inputs'].to(device).long()
-        labels = batch['labels'].to(device).long()
+        iterable,
+        desc=f"Eval ({epoch+1}/{total_epochs})",
+        total=max_batches,
+        position=position,
+        leave=False,
+        dynamic_ncols=True,
+    )
+
+    for _, batch, _ in bar:
+        inputs = batch["inputs"].to(device)
+        labels = batch["labels"].to(device)
 
         carry = model.init_carry(inputs.shape[0], device)
 
@@ -579,7 +568,7 @@ def main(hydra_cfg: DictConfig):
     )
 
     use_wandb = bool(getattr(cfg, "wandb", {}).get("enabled", False)) and (wandb is not None)
-    if use_wandb:
+    if use_wandb and not (cfg.load_checkpoint and cfg.resume):
         wandb.init(
             entity="mrtshv-innopolis-university",
             project=cfg.wandb.get("project", "baseline"),
@@ -609,10 +598,24 @@ def main(hydra_cfg: DictConfig):
     start_epoch = 0
     step = 0
 
-    if getattr(cfg, "resume", False) and getattr(cfg, "load_checkpoint", None):
-        start_epoch, step, best_score = load_checkpoint(cfg.load_checkpoint, model, opt, device)
-        # continue from the next epoch
-        start_epoch = min(start_epoch, cfg.epochs - 1)
+    if cfg.resume and cfg.load_checkpoint:
+        start_epoch, step, best_score, wandb_run_id = load_checkpoint(cfg.load_checkpoint, model, opt, device)
+        if wandb_run_id is None:
+            wandb_run_id = getattr(cfg, "wandb.resume_run_id", None)
+        wandb.init(
+            entity="mrtshv-innopolis-university",
+            project=cfg.wandb.get("project", "baseline"),
+            id=wandb_run_id,
+            resume="must",
+            name=cfg.run_name,
+            group=cfg.wandb.get("group", "sandbox"),
+            mode=cfg.wandb.get("mode", "online"),
+            config=cfg.model_dump(),
+            tags=build_arch_tags(cfg),
+        )
+        wandb.watch(model)
+        print(f"[W&B] Logging enabled — run: {wandb.run.name if wandb.run else 'None'}")
+
 
     master_bar = tqdm(range(start_epoch, cfg.epochs), desc="Training", position=0, leave=True, dynamic_ncols=True)
     for epoch in master_bar:
