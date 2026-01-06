@@ -179,9 +179,6 @@ def save_checkpoint(path: str, model, opt, epoch: int, step: int, cfg: TrainConf
         "rng_python": random.getstate(),
         "rng_numpy": np.random.get_state(),
         "rng_torch": torch.random.get_rng_state(),
-
-        # wandb
-        "wandb_run_id": wandb.run.id if wandb.run else None,
     }
     if torch.cuda.is_available():
         ckpt["rng_torch_cuda"] = torch.cuda.get_rng_state_all()
@@ -363,10 +360,6 @@ def train_one_epoch(
     delta_all_list: List[float] = []
     
     bar = tqdm(
-
-
-
-        
                 loader, 
                 desc=f"Train ({epoch+1}/{total_epochs})",
                 total=total_train_batches,
@@ -375,9 +368,8 @@ def train_one_epoch(
                 dynamic_ncols=True
             )
     for set_name, batch, _ in bar:
-        step += 1
-        inputs = batch['inputs'].to(device)
-        labels = batch['labels'].to(device)
+        inputs = batch['inputs'].to(device).long()
+        labels = batch['labels'].to(device).long()
         carry = model.init_carry(inputs.shape[0], device)
 
         first_acc_blank = None
@@ -391,6 +383,7 @@ def train_one_epoch(
             pg["lr"] = lr_now
 
         for ep in range(episodes):
+            step += 1
             carry, loss, acc_blank, acc_all = train_one_episode(
             model,
             inputs,
@@ -431,7 +424,7 @@ def train_one_epoch(
                 "train/loss_ce": last_loss_value,
                 "train/acc_blank": last_acc_blank,
                 "train/acc_all": last_acc_all,
-                "train/delta_blank_acc": delta_blank,
+                # "train/delta_blank_acc": delta_blank,
                 # "train/delta_all_acc": delta_all,
                 # "train/episodes": episodes,
                 "step": step,
@@ -444,7 +437,7 @@ def train_one_epoch(
         avg_delta_all = sum(delta_all_list) / max(1, len(delta_all_list))
 
         wandb.log({
-            "reasoning_effectiveness/avg_delta_blank_acc": avg_delta_blank,
+            "reasoning_effectiveness/train_delta_acc": avg_delta_blank,
             # "reasoning_effectiveness/avg_delta_all_acc": avg_delta_all,
             # "reasoning_effectiveness/episodes": episodes,
             "epoch": epoch + 1,
@@ -475,17 +468,16 @@ def evaluate(
 
     iterable = loader if max_batches is None else islice(loader, max_batches)
     bar = tqdm(
-        iterable,
-        desc=f"Eval ({epoch+1}/{total_epochs})",
-        total=max_batches,
-        position=position,
-        leave=False,
-        dynamic_ncols=True,
-    )
-
-    for _, batch, _ in bar:
-        inputs = batch["inputs"].to(device)
-        labels = batch["labels"].to(device)
+                iterable, 
+                desc=f"Eval ({epoch+1}/{total_epochs})", 
+                total=max_batches, 
+                position=position, 
+                leave=False, 
+                dynamic_ncols=True
+            )
+    for set_name, batch, _ in bar:
+        inputs = batch['inputs'].to(device).long()
+        labels = batch['labels'].to(device).long()
 
         carry = model.init_carry(inputs.shape[0], device)
 
@@ -601,7 +593,7 @@ def main(hydra_cfg: DictConfig):
     if cfg.resume and cfg.load_checkpoint:
         start_epoch, step, best_score, wandb_run_id = load_checkpoint(cfg.load_checkpoint, model, opt, device)
         if wandb_run_id is None:
-            wandb_run_id = getattr(cfg, "wandb.resume_run_id", None)
+            wandb_run_id =cfg.wandb.get("resume_run_id", None)
         wandb.init(
             entity="mrtshv-innopolis-university",
             project=cfg.wandb.get("project", "baseline"),
@@ -615,7 +607,6 @@ def main(hydra_cfg: DictConfig):
         )
         wandb.watch(model)
         print(f"[W&B] Logging enabled — run: {wandb.run.name if wandb.run else 'None'}")
-
 
     master_bar = tqdm(range(start_epoch, cfg.epochs), desc="Training", position=0, leave=True, dynamic_ncols=True)
     for epoch in master_bar:
@@ -653,7 +644,7 @@ def main(hydra_cfg: DictConfig):
                     "eval/loss_ce": eval_loss,
                     "eval/acc_all": eval_acc_all,
                     "eval/acc_blank": eval_acc_blank,
-                    "eval/reasoning_effectivenes": eval_reasoning_effect,
+                    "reasoning_effectiveness/eval_delta_acc": eval_reasoning_effect,
                     "epoch": epoch + 1
                 })
             master_bar.set_postfix({

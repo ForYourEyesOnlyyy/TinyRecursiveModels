@@ -54,17 +54,17 @@ def build_run_name(cfg: Any) -> str:
     elif arch_class == "TRM":
         parts.append("TRM")
         n_layers = getattr(cfg.arch, "n_layers", None)
-        H_cycles = getattr(cfg.arch, "H_cycles", None)
-        L_cycles = getattr(cfg.arch, "L_cycles", None)
-        # tbptt = getattr(cfg.arch, "detach_till_last", None)
-        if H_cycles is not None:
-            parts.append(f"H{H_cycles}")
-        if L_cycles is not None:
-            parts.append(f"L{L_cycles}")
+        S_steps = getattr(cfg.arch, "S_steps", None)
+        R_steps = getattr(cfg.arch, "R_steps", None)
+        ep = getattr(cfg, "n_reasoning_episodes", None)
+        if ep is not None:
+            parts.append(f"EP{n_layers}")
+        if S_steps is not None:
+            parts.append(f"S{S_steps}")
+        if R_steps is not None:
+            parts.append(f"R{R_steps}")
         if n_layers is not None:
             parts.append(f"B{n_layers}")
-        # if tbptt is not None:
-        #     parts.append(f"TBPTT={tbptt}")
 
     # ---------- Unknown Arch ----------
     else:
@@ -96,8 +96,9 @@ def build_arch_tags(cfg) -> list[str]:
 
     # Optional fields — may not exist for baseline models
     n_layers  = getattr(cfg.arch, "n_layers", None)
-    H_cycles = getattr(cfg.arch, "H_cycles", None)
-    L_cycles = getattr(cfg.arch, "L_cycles", None)
+    S_steps = getattr(cfg.arch, "S_steps", None)
+    R_steps = getattr(cfg.arch, "R_steps", None)
+    ep = getattr(cfg, "n_reasoning_episodes", None)
     rec_steps = getattr(cfg.arch, "recursion_steps", None)
     tbptt     = getattr(cfg.arch, "detach_till_last", None)
     ds        = getattr(cfg.arch, "deep_supervision", None)
@@ -108,11 +109,14 @@ def build_arch_tags(cfg) -> list[str]:
     if n_layers is not None:
         tags.append(f"Backbone={n_layers}")
 
-    if H_cycles is not None:
-        tags.append(f"H_cycles={H_cycles}")
+    if S_steps is not None:
+        tags.append(f"S_steps={S_steps}")
 
-    if L_cycles is not None:
-        tags.append(f"L_cycles={L_cycles}")
+    if R_steps is not None:
+        tags.append(f"R_steps={R_steps}")
+
+    if ep is not None:
+        tags.append(f"Episodes={ep}")
 
     if rec_steps is not None:
         tags.append(f"T={rec_steps}")
