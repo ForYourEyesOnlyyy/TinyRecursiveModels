@@ -1,0 +1,14 @@
+torchrun --standalone --nproc_per_node=4 train_distributed.py \
+  device=cuda \
+  arch=trm \
+  data_paths="[data/sudoku-extreme-1k-aug-1000]" \
+  global_batch_size=768 \
+  epochs=50000 \
+  eval_interval=500 \
+  n_reasoning_episodes=8 \
+  arch.S_steps=3 \
+  arch.R_steps=6 \
+  arch.n_layers=2 \
+  arch.scale_input_injection=True \
+  wandb.group="TRM_NoACT_clean" \
+  +run_name="RM_NoACT_dist_EP8_S3_R6_B2_with-gating"

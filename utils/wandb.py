@@ -52,13 +52,13 @@ def build_run_name(cfg: Any) -> str:
             parts.append(f"RU={ru}")
 
     elif arch_class == "TRM":
-        parts.append("TRM")
+        parts.append("TRM_NoACT_dist")
         n_layers = getattr(cfg.arch, "n_layers", None)
         S_steps = getattr(cfg.arch, "S_steps", None)
         R_steps = getattr(cfg.arch, "R_steps", None)
         ep = getattr(cfg, "n_reasoning_episodes", None)
         if ep is not None:
-            parts.append(f"EP{n_layers}")
+            parts.append(f"EP{ep}")
         if S_steps is not None:
             parts.append(f"S{S_steps}")
         if R_steps is not None:
