@@ -520,7 +520,7 @@ def evaluate(
         acc_a = global_accuracy(logits, labels)
 
         losses.append(loss)
-        acc_blankl.append(acc_b)
+        acc_blank.append(acc_b)
         acc_all.append(acc_a)
 
         if rank == 0:
@@ -564,6 +564,11 @@ def main(hydra_cfg: DictConfig):
 
     # Model + optimizer
     model = build_model_from_cfg(cfg, train_meta, device)
+    if torch.cuda.is_available() and "DISABLE_COMPILE" not in os.environ:
+        model = torch.compile(model)
+        if is_main:
+            print("[model] compile enabled")
+
     opt = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.lr,
@@ -655,7 +660,7 @@ def main(hydra_cfg: DictConfig):
 
         # Eval only on rank 0 (simple + correct)
         if is_main and eval_loader is not None and ((epc + 1) % max(1, cfg.eval_interval) == 0):
-            eval_loss, eval_acc_all, eval_acc_blank, eval_delta = evaluate(
+            eval_loss, eval_acc_all, eval_acc_blank = evaluate(
                 model,
                 eval_loader,
                 device,
@@ -675,7 +680,7 @@ def main(hydra_cfg: DictConfig):
                     "global_step": step,
                 })
                 master_bar.set_postfix({
-                    "eval_epoch": f"{epoch+1}/{cfg.epochs}",
+                    "eval_epoch": f"{epc+1}/{cfg.epochs}",
                     "eval_loss": f"{eval_loss:.4f}",
                     "eval_blank_acc": f"{eval_acc_blank:.3f}"
                 })
