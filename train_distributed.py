@@ -369,6 +369,7 @@ def train_one_episode(
     carry,
     opt: torch.optim.Optimizer,
     *,
+    global_batch_size: int,
     blank_id: int,
 ) -> tuple:
     # One reasoning episode (your TRM forward signature)
@@ -389,7 +390,7 @@ def train_one_episode(
     loss = (per_token / loss_divisor).sum()            # scalar (exact TRM)
 
     opt.zero_grad(set_to_none=True)
-    loss.backward()
+    ((1 / global_batch_size) * loss).backward()
 
     # distributed gradient sync
     allreduce_grads(model)
@@ -420,6 +421,7 @@ def train_one_epoch(
     epoch: int,
     total_epochs: int,
     total_train_batches: Optional[int],
+    global_batch_size: int,
     rank: int,
 ) -> int:
     model.train()
@@ -442,7 +444,7 @@ def train_one_epoch(
                 pg["lr"] = lr_now
 
             carry, loss_val, acc_blank, acc_all = train_one_episode(
-                model, inputs, labels, carry, opt, blank_id=blank_id
+                model, inputs, labels, carry, opt, global_batch_size=global_batch_size, blank_id=blank_id
             )
 
             last_loss_val = loss_val
@@ -655,6 +657,7 @@ def main(hydra_cfg: DictConfig):
             epoch=epc,
             total_epochs=cfg.epochs,
             total_train_batches=steps_per_epoch,
+            global_batch_size=cfg.global_batch_size,
             rank=rank,
         )
 

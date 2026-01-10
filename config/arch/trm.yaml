@@ -17,3 +17,6 @@ R_steps: 1
 # ---------- recursion ----------
 scale_input_injection: True
 state_scale_init: 0.1  
+
+pos_encodings: rope
+rope_theta: 10000.0
