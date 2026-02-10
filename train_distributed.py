@@ -28,10 +28,6 @@ warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
-# -------------------------
-# Config
-# -------------------------
-
 class ArchConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra='allow')
     name: str
@@ -42,11 +38,9 @@ class TrainConfig(pydantic.BaseModel):
 
     arch: ArchConfig
 
-    # Names
     project_name: Optional[str] = None
     run_name: Optional[str] = None
 
-    # Data
     data_paths: List[str]
     data_split_train: str
     data_split_eval: str
@@ -54,7 +48,6 @@ class TrainConfig(pydantic.BaseModel):
     global_batch_size: int
     max_eval_batches: Optional[int] = None
 
-    # Optimizer
     lr: float
     lr_min_ratio: float = 1.0
     lr_warmup_steps: int = 0
@@ -62,13 +55,11 @@ class TrainConfig(pydantic.BaseModel):
     beta1: float = 0.9
     beta2: float = 0.999
 
-    # Training
     seed: int = 0
     epochs: int
     eval_interval: int
     device: str = "auto"  # "cpu" | "cuda" | "mps" | "auto"
 
-    # Checkpointing
     checkpoint_dir: Optional[str] = None
     save_every: Optional[int] = None
     save_best: bool = True
@@ -77,7 +68,6 @@ class TrainConfig(pydantic.BaseModel):
     best_metric: str = "eval_acc_blank"
     best_mode: str = "max"  # "max" or "min"
 
-    # Logging
     wandb: dict[str, Any] = {}
 
 
@@ -85,31 +75,24 @@ def load_synced_config(hydra_cfg: DictConfig) -> TrainConfig:
     cfg_dict = OmegaConf.to_container(hydra_cfg, resolve=True)
     cfg = TrainConfig(**cfg_dict)
 
-    # project_name default
     if cfg.project_name is None:
         proj = cfg.wandb.get("project") if cfg.wandb else None
         if proj is None:
             proj = cfg.arch.name + "-" + os.path.basename(cfg.data_paths[0]).capitalize()
         cfg.project_name = proj
 
-    # run_name default
     if cfg.run_name is None:
         cfg.run_name = build_run_name(cfg)
 
-    # checkpoint dir default
     if cfg.checkpoint_dir is None:
         cfg.checkpoint_dir = os.path.join("checkpoints", cfg.project_name, cfg.run_name)
 
-    # save_every default
     if cfg.save_every is None:
         cfg.save_every = cfg.eval_interval
 
     return cfg
 
 
-# -------------------------
-# Distributed helpers
-# -------------------------
 
 def is_distributed() -> bool:
     return "LOCAL_RANK" in os.environ
@@ -130,7 +113,6 @@ def setup_distributed(cfg: TrainConfig) -> tuple[int, int, int, torch.device]:
         dist.init_process_group(backend="nccl")
         torch.cuda.set_device(local_rank)
 
-    # Device per rank
     if cfg.device in ("cuda", "auto") and torch.cuda.is_available():
         device = torch.device(f"cuda:{local_rank}" if is_distributed() else "cuda")
     else:
@@ -164,10 +146,25 @@ def allreduce_grads(model: nn.Module):
             dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
             p.grad.div_(world_size)
 
+def ddp_sum_metrics(metrics: Dict[str, float], device: torch.device) -> Dict[str, float]:
+    """
+    Sum-reduce a dict of scalar metrics across ranks.
 
-# -------------------------
-# Data / model
-# -------------------------
+    - If dist is not initialized, returns input unchanged.
+    - Uses float64 for numeric stability.
+    - Reduction is SUM; caller handles normalization (divide) afterwards.
+
+    Keys are reduced in sorted order to ensure consistent packing.
+    """
+    if not dist.is_initialized():
+        return metrics
+
+    keys = sorted(metrics.keys())
+    vec = torch.tensor([metrics[k] for k in keys], device=device, dtype=torch.float64)
+    dist.all_reduce(vec, op=dist.ReduceOp.SUM)
+    return {k: float(vec[i].item()) for i, k in enumerate(keys)}
+
+
 
 def make_dataloader(cfg: TrainConfig, split: str, rank: int, world_size: int):
     ds_cfg = PuzzleDatasetConfig(
@@ -208,9 +205,6 @@ def build_model_from_cfg(cfg: TrainConfig, metadata, device: torch.device) -> nn
     return model
 
 
-# -------------------------
-# Checkpointing
-# -------------------------
 
 def _resolve_ckpt_dir(cfg: TrainConfig) -> str:
     base = cfg.checkpoint_dir
@@ -242,7 +236,6 @@ def load_checkpoint(path: str, model, opt, device: torch.device):
         print(f"[checkpoint] no checkpoint at: {path}")
         return 0, 0, None, None
 
-    # Load on CPU to avoid RNG device issues
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
 
     missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
@@ -290,9 +283,6 @@ def load_checkpoint(path: str, model, opt, device: torch.device):
     return epoch, step, best_score, wandb_run_id
 
 
-# -------------------------
-# Misc utils
-# -------------------------
 
 def get_device(cfg: TrainConfig) -> torch.device:
     if cfg.device == "cuda" and torch.cuda.is_available():
@@ -336,31 +326,65 @@ def print_gpu_stats(device: torch.device, rank: int, world_size: int):
 
 
 @torch.no_grad()
-def blank_accuracy(logits: torch.Tensor, labels: torch.Tensor, inputs: torch.Tensor, *, blank_id=1, ignore_index=0) -> float:
+def global_accuracy_counts(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    ignore_index: int = IGNORE_LABEL_ID,
+) -> Tuple[int, int]:
+    """
+    Returns (correct, total) over all valid tokens.
+    """
     preds = logits.argmax(dim=-1)
-    blank_mask = (inputs == blank_id)
-    valid = (labels != ignore_index) & blank_mask
-    total = valid.float().sum().item()
-    if total == 0.0:
-        return 0.0
-    correct = ((preds == labels) & valid).float().sum().item()
-    return correct / total
+    valid = (labels != ignore_index)
+    correct = ((preds == labels) & valid).sum().item()
+    total = valid.sum().item()
+    return int(correct), int(total)
 
 
 @torch.no_grad()
-def global_accuracy(logits: torch.Tensor, labels: torch.Tensor, ignore_index=0) -> float:
+def blank_accuracy_counts(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    inputs: torch.Tensor,
+    *,
+    blank_id: int,
+    ignore_index: int = IGNORE_LABEL_ID,
+) -> Tuple[int, int]:
+    """
+    Returns (correct, total) restricted to blank positions of the input.
+    """
     preds = logits.argmax(dim=-1)
-    valid = (labels != ignore_index)
-    total = valid.float().sum().item()
-    if total == 0.0:
-        return 0.0
-    correct = ((preds == labels) & valid).float().sum().item()
-    return correct / total
+    blank_mask = (inputs == blank_id)
+    valid = (labels != ignore_index) & blank_mask
+    correct = ((preds == labels) & valid).sum().item()
+    total = valid.sum().item()
+    return int(correct), int(total)
 
 
-# -------------------------
-# Training / Eval
-# -------------------------
+@torch.no_grad()
+def exact_accuracy_counts(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    ignore_index: int = IGNORE_LABEL_ID,
+) -> Tuple[int, int]:
+    preds = logits.argmax(dim=-1)                # [B, L]
+    mask = (labels != ignore_index)              # [B, L]
+
+    loss_counts = mask.sum(-1)                   # [B]
+    valid_metrics = (loss_counts > 0)            # [B]
+
+    is_correct = mask & (preds == labels)        # [B, L]
+    seq_is_correct = (is_correct.sum(-1) == loss_counts)  # [B]
+
+    correct_exact = (valid_metrics & seq_is_correct).sum().item()
+    total_exact = valid_metrics.sum().item()
+
+    return int(correct_exact), int(total_exact)
+
+
+
 
 def train_one_episode(
     model: nn.Module,
@@ -372,11 +396,9 @@ def train_one_episode(
     global_batch_size: int,
     blank_id: int,
 ) -> tuple:
-    # One reasoning episode (your TRM forward signature)
     carry, logits = model(inputs, carry)
 
-    # Stablemax CE (per-token), then reduce with ignore mask
-    mask = (labels != IGNORE_LABEL_ID)                 # [B, L] bool
+    mask = (labels != IGNORE_LABEL_ID)                 # [B, L]
     loss_counts = mask.sum(-1)                         # [B]
     loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)  # [B, 1]
 
@@ -387,21 +409,23 @@ def train_one_episode(
         valid_mask=mask,
     )                                                  # [B, L]
 
-    loss = (per_token / loss_divisor).sum()            # scalar (exact TRM)
+    loss = (per_token / loss_divisor).sum()      
 
     opt.zero_grad(set_to_none=True)
     ((1 / global_batch_size) * loss).backward()
 
-    # distributed gradient sync
     allreduce_grads(model)
 
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     opt.step()
 
-    acc_blank = blank_accuracy(logits, labels, inputs, blank_id=blank_id)
-    acc_all = global_accuracy(logits, labels)
+    c, t = global_accuracy_counts(logits, labels, ignore_index=IGNORE_LABEL_ID)
+    acc_all = float(c / max(t, 1))
 
-    return carry, float(loss.item()), acc_blank, acc_all
+    c, t = exact_accuracy_counts(logits, labels, ignore_index=IGNORE_LABEL_ID)
+    acc_exact = float(c / max(t, 1))
+    return carry, float(loss.item()), acc_all, acc_exact
+
 
 
 def train_one_epoch(
@@ -434,31 +458,35 @@ def train_one_epoch(
         carry = model.init_carry(inputs.shape[0], device)
 
         last_loss_val = None
-        last_acc_blank = None
         last_acc_all = None
+        last_acc_exact = None
 
         for _ep in range(max(1, episodes)):
-            # LR per optimizer step
             lr_now = cosine_warmup_lr(step, base_lr, warmup, total_steps, min_ratio)
             for pg in opt.param_groups:
                 pg["lr"] = lr_now
 
-            carry, loss_val, acc_blank, acc_all = train_one_episode(
-                model, inputs, labels, carry, opt, global_batch_size=global_batch_size, blank_id=blank_id
+            carry, loss_val, acc_all, acc_exact = train_one_episode(
+                model,
+                inputs,
+                labels,
+                carry,
+                opt,
+                global_batch_size=global_batch_size,
+                blank_id=blank_id,
             )
 
             last_loss_val = loss_val
-            last_acc_blank = acc_blank
             last_acc_all = acc_all
+            last_acc_exact = acc_exact
 
             step += 1
 
-        # Log once per batch (rank 0 only), same behavior as before
         if rank == 0 and use_wandb and wandb is not None:
             wandb.log({
-                "train/loss_ce": last_loss_val,
-                "train/acc_blank": last_acc_blank,
-                "train/acc_all": last_acc_all,
+                "train/lm_loss": last_loss_val,
+                "train/accuracy": last_acc_all,
+                "train/exact_accuracy": last_acc_exact,
                 "epoch": epoch + 1,
                 "global_step": step,
             })
@@ -479,21 +507,34 @@ def evaluate(
     total_epochs: int,
     rank: int,
 ) -> Tuple[float, float, float, float]:
+    """
+    Distributed eval (runs on all ranks):
+      - each rank evaluates its own shard from PuzzleDataset(rank, num_replicas)
+      - sums totals across ranks via ddp_sum_metrics
+      - returns globally-aggregated metrics on every rank
+    """
     model.eval()
 
-    losses: List[float] = []
-    acc_all: List[float] = []
-    acc_blank: List[float] = []
+    loss_sum_seqmeans = 0.0  
+    seq_count = 0.0
+
+    correct_all = 0.0
+    total_all = 0.0
+    correct_blank = 0.0
+    total_blank = 0.0
+    correct_exact = 0.0
+    total_exact = 0.0
 
     iterable = loader if max_batches is None else islice(loader, max_batches)
+
     bar = tqdm(
         iterable,
         desc=f"Eval ({epoch+1}/{total_epochs})",
-        total=max_batches,
+        total=max_batches,      # None -> unknown length (safe for IterableDataset)
         position=1,
         leave=False,
         dynamic_ncols=True,
-        disable=(rank != 0),
+        disable=(rank != 0), 
     )
 
     for _, batch, _ in bar:
@@ -501,49 +542,63 @@ def evaluate(
         labels = batch["labels"].to(device).long()
 
         carry = model.init_carry(inputs.shape[0], device)
-
-        for ep in range(max(1, episodes_eval)):
+        for _ in range(max(1, episodes_eval)):
             carry, logits = model(inputs, carry)
 
-        mask = (labels != IGNORE_LABEL_ID)              # [B, L]
-        loss_counts = mask.sum(-1)                      # [B]
-        loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)
+        mask = (labels != IGNORE_LABEL_ID)
+        loss_counts = mask.sum(-1)                             # [B]
+        loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)  # [B, 1]
 
         per_token = stablemax_cross_entropy(
             logits,
             labels,
             ignore_index=IGNORE_LABEL_ID,
             valid_mask=mask,
-        )                                               # [B, L]
+        )                                                      # [B, L]
 
-        loss = (per_token / loss_divisor).sum().item() # scalar
+        loss_sum_seqmeans += float((per_token / loss_divisor).sum().item())
+        seq_count += float((loss_counts > 0).sum().item())
 
-        acc_b = blank_accuracy(logits, labels, inputs, blank_id=blank_id)
-        acc_a = global_accuracy(logits, labels)
+        c, t = global_accuracy_counts(logits, labels, ignore_index=IGNORE_LABEL_ID)
+        correct_all += float(c); total_all += float(t)
 
-        losses.append(loss)
-        acc_blank.append(acc_b)
-        acc_all.append(acc_a)
+        c, t = exact_accuracy_counts(logits, labels, ignore_index=IGNORE_LABEL_ID)
+        correct_exact += float(c); total_exact += float(t)
 
         if rank == 0:
+            running_loss = loss_sum_seqmeans / max(seq_count, 1.0)
             bar.set_postfix({
-                "loss": f"{loss:.4f}",
-                "blank_acc": f"{acc_b:.3f}",
+                "loss": f"{running_loss:.4f}",
+                "blank_acc": f"{(correct_blank / max(total_blank, 1.0)):.3f}",
             })
 
     bar.close()
 
-    n = max(1, len(losses))
-    avg_loss = sum(losses) / n
-    avg_acc_all = sum(acc_all) / n
-    avg_acc_blank = sum(acc_blank) / n
+    totals = ddp_sum_metrics(
+        {
+            "loss_sum_seqmeans": loss_sum_seqmeans,
+            "seq_count": seq_count,
+            "correct_all": correct_all,
+            "total_all": total_all,
+            "correct_exact": correct_exact,
+            "total_exact": total_exact,
+        },
+        device=device,
+    )
 
-    return avg_loss, avg_acc_all, avg_acc_blank
+    loss_sum_seqmeans = totals["loss_sum_seqmeans"]
+    seq_count = totals["seq_count"]
+
+    correct_all = totals["correct_all"]; total_all = totals["total_all"]
+    correct_exact = totals["correct_exact"]; total_exact = totals["total_exact"]
+
+    avg_loss = loss_sum_seqmeans / max(seq_count, 1.0)
+    acc_all = float(correct_all / max(total_all, 1.0))
+    acc_exact = float(correct_exact / max(total_exact, 1.0))
+
+    return avg_loss, acc_all, acc_exact
 
 
-# -------------------------
-# Main
-# -------------------------
 
 @hydra.main(config_path="config", config_name="cfg_pretrain", version_base=None)
 def main(hydra_cfg: DictConfig):
@@ -552,19 +607,16 @@ def main(hydra_cfg: DictConfig):
     rank, world_size, local_rank, device = setup_distributed(cfg)
     is_main = (rank == 0)
 
-    # Useful startup prints (only once per process)
     if is_main:
         print(f"[run] project={cfg.project_name} run_name={cfg.run_name}")
         print(f"[dist] rank={rank} world_size={world_size} local_rank={local_rank} device={device}")
     print_gpu_stats(device, rank, world_size)
 
-    # Dataloaders
     train_loader, train_meta = make_dataloader(cfg, split="train", rank=rank, world_size=world_size)
     eval_loader = None
     if os.path.exists(os.path.join(cfg.data_paths[0], "test", "dataset.json")):
         eval_loader, _ = make_dataloader(cfg, split="test", rank=rank, world_size=world_size)
 
-    # Model + optimizer
     model = build_model_from_cfg(cfg, train_meta, device)
     if torch.cuda.is_available() and "DISABLE_COMPILE" not in os.environ:
         model = torch.compile(model)
@@ -578,7 +630,6 @@ def main(hydra_cfg: DictConfig):
         betas=(cfg.beta1, cfg.beta2),
     )
 
-    # Resume (rank 0 loads, then broadcast)
     ckpt_dir = _resolve_ckpt_dir(cfg)
     last_ckpt = os.path.join(ckpt_dir, "last.ckpt")
     best_ckpt = os.path.join(ckpt_dir, "best.ckpt")
@@ -597,7 +648,6 @@ def main(hydra_cfg: DictConfig):
             start_epoch, step, best_score, wandb_run_id = obj
             broadcast_model(model, src=0)
 
-    # W&B (rank 0 only)
     use_wandb = is_main and bool(cfg.wandb.get("enabled", False)) and (wandb is not None)
     if use_wandb:
         if cfg.resume and cfg.load_checkpoint and wandb_run_id is not None:
@@ -630,7 +680,6 @@ def main(hydra_cfg: DictConfig):
     elif is_main:
         print("[W&B] disabled")
 
-    # Steps per epoch + total_steps
     steps_per_epoch = sum(1 for _ in iter(train_loader))
     episodes = int(getattr(cfg, "n_reasoning_episodes", 1))
     total_steps = cfg.epochs * steps_per_epoch * max(1, episodes)
@@ -638,7 +687,6 @@ def main(hydra_cfg: DictConfig):
     if is_main:
         print(f"[train] steps_per_epoch={steps_per_epoch} episodes={episodes} total_steps={total_steps}")
 
-    # Training loop
     master_bar = tqdm(range(start_epoch, cfg.epochs), desc="Training", position=0, leave=True, dynamic_ncols=True, disable=not is_main)
     for epc in master_bar:
         step = train_one_epoch(
@@ -662,8 +710,8 @@ def main(hydra_cfg: DictConfig):
         )
 
         # Eval only on rank 0 (simple + correct)
-        if is_main and eval_loader is not None and ((epc + 1) % max(1, cfg.eval_interval) == 0):
-            eval_loss, eval_acc_all, eval_acc_blank = evaluate(
+        if eval_loader is not None and ((epc + 1) % max(1, cfg.eval_interval) == 0):
+            eval_loss, eval_acc_all, eval_acc_blank, eval_acc_exact = evaluate(
                 model,
                 eval_loader,
                 device,
@@ -674,21 +722,21 @@ def main(hydra_cfg: DictConfig):
                 total_epochs=cfg.epochs,
                 rank=rank,
             )
-            if use_wandb:
-                wandb.log({
-                    "eval/loss_ce": eval_loss,
-                    "eval/acc_all": eval_acc_all,
-                    "eval/acc_blank": eval_acc_blank,
-                    "epoch": epc + 1,
-                    "global_step": step,
-                })
-                master_bar.set_postfix({
-                    "eval_epoch": f"{epc+1}/{cfg.epochs}",
-                    "eval_loss": f"{eval_loss:.4f}",
-                    "eval_blank_acc": f"{eval_acc_blank:.3f}"
-                })
+            if is_main:
+                if use_wandb:
+                    wandb.log({
+                        "all.lm_loss": eval_loss,
+                        "all.accuracy": eval_acc_all,
+                        "all.exact_accuracy"
+                        "epoch": epc + 1,
+                        "global_step": step,
+                    })
+                    master_bar.set_postfix({
+                        "eval_epoch": f"{epc+1}/{cfg.epochs}",
+                        "eval_loss": f"{eval_loss:.4f}",
+                        "eval_acc": f"{eval_acc_exact:.3f}"
+                    })
 
-            # Save best on rank 0
             current = eval_acc_blank if cfg.best_metric == "eval_acc_blank" else eval_loss
             better = (best_score is None) or ((cfg.best_mode == "max" and current > best_score) or (cfg.best_mode == "min" and current < best_score))
             if better and cfg.save_best:
