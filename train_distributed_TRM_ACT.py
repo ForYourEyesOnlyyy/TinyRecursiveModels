@@ -21,6 +21,8 @@ from utils.functions import load_model_class
 from utils.wandb import build_run_name, build_arch_tags
 from models.losses import IGNORE_LABEL_ID
 from models.losses import ACTLossHead
+from models.recursive_reasoning.TRM_ACT import TRM_ACTCarry
+from models.recursive_reasoning.TRM_NoACT import TRMCarry
 
 import warnings
 
@@ -414,6 +416,16 @@ def train_one_act_step(
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     opt.step()
 
+    new_carry = TRM_ACTCarry(
+    inner_carry=TRMCarry(
+        Z_S=new_carry.inner_carry.Z_S.detach(),
+        Z_R=new_carry.inner_carry.Z_R.detach(),
+    ),
+    steps=new_carry.steps,               
+    halted=new_carry.halted,
+    last_logits=new_carry.last_logits.detach(),
+)
+
     return new_carry, loss, metrics, all_finish
 
 
@@ -437,10 +449,9 @@ def train_one_epoch(
     step = step0
 
     for _, batch, _ in loader:
-        inputs = batch["inputs"].to(device).long()
-        labels = batch["labels"].to(device).long()
-
-        carry = model.initial_carry(inputs)
+        batch = {k: v.to(device).long() for k, v in batch.items()}
+        labels = batch['labels']
+        carry = model.initial_carry(batch)
         last_lm_loss = None
         last_q_halt_loss = None
         last_total_loss = None
@@ -495,6 +506,7 @@ def train_one_epoch(
 
 @torch.no_grad()
 def evaluate(
+    model:nn.Module,
     loss_head: nn.Module,
     loader: DataLoader,
     device: torch.device,
@@ -531,9 +543,9 @@ def evaluate(
     )
 
     for _, batch, _ in bar:
-        batch = {k: v.to(device) for k, v in batch.items()}
+        batch = {k: v.to(device).long() for k, v in batch.items()}
 
-        carry = loss_head.initial_carry(batch)
+        carry = model.initial_carry(batch)
 
         last_loss = None
         last_metrics = None
@@ -705,6 +717,7 @@ def main(hydra_cfg: DictConfig):
 
         if eval_loader is not None and ((epc + 1) % max(1, cfg.eval_interval) == 0):
             eval_lm_loss, eval_acc_all, eval_acc_exact, eval_q_halt_loss, avg_total_loss = evaluate(
+                model,
                 loss_head,
                 eval_loader,
                 device,

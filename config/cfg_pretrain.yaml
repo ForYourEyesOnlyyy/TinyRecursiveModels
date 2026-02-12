@@ -10,7 +10,6 @@ data_split_train: "train"
 data_split_eval: "test"
 blank_id: 1
 global_batch_size: 256              # total examples per batch (single GPU)
-max_eval_batches: 4
 
 # optimizer
 lr: 1e-4
@@ -34,7 +33,7 @@ save_every: ${eval_interval} # save last.ckpt every N epochs (or pick a number)
 save_best: true              # also save best.ckpt by metric
 resume: true                 # resume if load_checkpoint is set
 load_checkpoint: null        # set to a .ckpt path to resume
-best_metric: "eval_acc_blank"
+best_metric: "eval_acc_exact"
 best_mode: "max"             # "max" or "min"
 
 # wandb
