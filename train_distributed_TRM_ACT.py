@@ -20,7 +20,7 @@ from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig
 from utils.functions import load_model_class
 from utils.wandb import build_run_name, build_arch_tags
 from models.losses import IGNORE_LABEL_ID
-from models.losses import stablemax_cross_entropy
+from models.losses import ACTLossHead
 
 import warnings
 
@@ -383,58 +383,45 @@ def exact_accuracy_counts(
 
     return int(correct_exact), int(total_exact)
 
-
-
-
-def train_one_episode(
-    model: nn.Module,
-    inputs: torch.Tensor,
-    labels: torch.Tensor,
+def train_one_act_step(
+    loss_head: nn.Module,
+    model: nn.Module,                 
+    batch: Dict[str, torch.Tensor],
     carry,
     opt: torch.optim.Optimizer,
     *,
     global_batch_size: int,
-    blank_id: int,
-) -> tuple:
-    carry, logits = model(inputs, carry)
-
-    mask = (labels != IGNORE_LABEL_ID)                 # [B, L]
-    loss_counts = mask.sum(-1)                         # [B]
-    loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)  # [B, 1]
-
-    per_token = stablemax_cross_entropy(
-        logits,
-        labels,
-        ignore_index=IGNORE_LABEL_ID,
-        valid_mask=mask,
-    )                                                  # [B, L]
-
-    loss = (per_token / loss_divisor).sum()      
+):
+    """
+    One ACT optimizer step (fixed-batch):
+      - run ONE ACT step via loss_head
+      - backward once
+      - optimizer step once
+    Returns:
+      new_carry, loss (scalar tensor), metrics (dict), all_finish (bool)
+    """
+    new_carry, loss, metrics, _, all_finish = loss_head(
+        return_keys=[],
+        carry=carry,
+        batch=batch,
+    )
 
     opt.zero_grad(set_to_none=True)
-    ((1 / global_batch_size) * loss).backward()
+    (loss / global_batch_size).backward()
 
     allreduce_grads(model)
 
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     opt.step()
 
-    c, t = global_accuracy_counts(logits, labels, ignore_index=IGNORE_LABEL_ID)
-    acc_all = float(c / max(t, 1))
-
-    c, t = exact_accuracy_counts(logits, labels, ignore_index=IGNORE_LABEL_ID)
-    acc_exact = float(c / max(t, 1))
-    return carry, float(loss.item()), acc_all, acc_exact
-
+    return new_carry, loss, metrics, all_finish
 
 
 def train_one_epoch(
     model: nn.Module,
+    loss_head: nn.Module,
     loader: DataLoader,
     device: torch.device,
-    *,
-    episodes: int,
-    blank_id: int,
     base_lr: float,
     warmup: int,
     total_steps: int,
@@ -443,8 +430,6 @@ def train_one_epoch(
     opt: torch.optim.Optimizer,
     use_wandb: bool,
     epoch: int,
-    total_epochs: int,
-    total_train_batches: Optional[int],
     global_batch_size: int,
     rank: int,
 ) -> int:
@@ -455,38 +440,52 @@ def train_one_epoch(
         inputs = batch["inputs"].to(device).long()
         labels = batch["labels"].to(device).long()
 
-        carry = model.init_carry(inputs.shape[0], device)
+        carry = model.initial_carry(inputs)
+        last_lm_loss = None
+        last_q_halt_loss = None
+        last_total_loss = None
 
-        last_loss = None
-        last_acc = None
-        last_acc_exact = None
-
-        for _ep in range(max(1, episodes)):
+        while True:
             lr_now = cosine_warmup_lr(step, base_lr, warmup, total_steps, min_ratio)
             for pg in opt.param_groups:
                 pg["lr"] = lr_now
 
-            carry, loss, acc_all, acc_exact = train_one_episode(
-                model,
-                inputs,
-                labels,
-                carry,
-                opt,
+            carry, loss_t, metrics, all_finish = train_one_act_step(
+                loss_head=loss_head,
+                model=model,
+                batch=batch,
+                carry=carry,
+                opt=opt,
                 global_batch_size=global_batch_size,
-                blank_id=blank_id,
             )
 
-            last_loss = loss
-            last_acc = acc_all
-            last_acc_exact = acc_exact
+            last_total_loss = float(loss_t.item()) / global_batch_size
+            last_lm_loss = float(metrics["lm_loss"]) / global_batch_size
+            last_q_halt_loss = float(metrics["q_halt_loss"]) / global_batch_size
 
             step += 1
 
+            if bool(all_finish):
+                break
+
+        final_logits = carry.last_logits  # [B,L,V]
+
+        c, t = global_accuracy_counts(final_logits, labels, ignore_index=IGNORE_LABEL_ID)
+        acc_all = c / max(t, 1)
+
+        c, t = exact_accuracy_counts(final_logits, labels, ignore_index=IGNORE_LABEL_ID)
+        acc_exact = c / max(t, 1)
+
+        steps_mean = carry.steps.float().mean().item()
+
         if rank == 0 and use_wandb and wandb is not None:
             wandb.log({
-                "train/lm_loss": last_loss,
-                "train/accuracy": last_acc,
-                "train/exact_accuracy": last_acc_exact,
+                "train/lm_loss": last_lm_loss,
+                "train/q_halt_loss": last_q_halt_loss,
+                "train/total_loss": last_total_loss,
+                "train/accuracy": acc_all,
+                "train/exact_accuracy": acc_exact,
+                "train/steps_mean": steps_mean,
                 "epoch": epoch + 1,
                 "global_step": step,
             })
@@ -496,107 +495,104 @@ def train_one_epoch(
 
 @torch.no_grad()
 def evaluate(
-    model: nn.Module,
+    loss_head: nn.Module,
     loader: DataLoader,
     device: torch.device,
-    *,
-    episodes_eval: int,
-    blank_id: int,
     max_batches: Optional[int],
-    epoch: int,
-    total_epochs: int,
     rank: int,
-) -> Tuple[float, float, float, float]:
+) -> Tuple[float, float, float, float, float]:
     """
-    Distributed eval (runs on all ranks):
-      - each rank evaluates its own shard from PuzzleDataset(rank, num_replicas)
-      - sums totals across ranks via ddp_sum_metrics
-      - returns globally-aggregated metrics on every rank
+    Distributed eval on ALL ranks:
+      - run ACT steps via loss_head until all_finish
+      - take ONLY the last-step losses/metrics (like your training logging strategy)
+      - sum totals across ranks using ddp_sum_metrics
+      - compute global averages
     """
-    model.eval()
+    loss_head.eval()
 
-    loss_sum_seqmeans = 0.0  
-    seq_count = 0.0
+    # local sums
+    sum_count = 0.0
+    sum_acc = 0.0
+    sum_exact = 0.0
 
-    correct_all = 0.0
-    total_all = 0.0
-    correct_blank = 0.0
-    total_blank = 0.0
-    correct_exact = 0.0
-    total_exact = 0.0
+    sum_lm_loss = 0.0
+    sum_q_halt_loss = 0.0
+    sum_total_loss = 0.0
 
     iterable = loader if max_batches is None else islice(loader, max_batches)
-
     bar = tqdm(
         iterable,
-        desc=f"Eval ({epoch+1}/{total_epochs})",
-        total=max_batches,      # None -> unknown length (safe for IterableDataset)
+        desc=f"Eval",
+        total=max_batches,
         position=1,
         leave=False,
         dynamic_ncols=True,
-        disable=(rank != 0), 
+        disable=(rank != 0),
     )
 
     for _, batch, _ in bar:
-        inputs = batch["inputs"].to(device).long()
-        labels = batch["labels"].to(device).long()
+        batch = {k: v.to(device) for k, v in batch.items()}
 
-        carry = model.init_carry(inputs.shape[0], device)
-        for _ in range(max(1, episodes_eval)):
-            carry, logits = model(inputs, carry)
+        carry = loss_head.initial_carry(batch)
 
-        mask = (labels != IGNORE_LABEL_ID)
-        loss_counts = mask.sum(-1)                             # [B]
-        loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)  # [B, 1]
+        last_loss = None
+        last_metrics = None
 
-        per_token = stablemax_cross_entropy(
-            logits,
-            labels,
-            ignore_index=IGNORE_LABEL_ID,
-            valid_mask=mask,
-        )                                                      # [B, L]
+        # ACT loop (same as training)
+        while True:
+            carry, loss_t, metrics, _, all_finish = loss_head(
+                carry=carry,
+                batch=batch,
+                return_keys=[],
+            )
+            last_loss = loss_t
+            last_metrics = metrics
 
-        loss_sum_seqmeans += float((per_token / loss_divisor).sum().item())
-        seq_count += float((loss_counts > 0).sum().item())
+            if bool(all_finish):
+                break
 
-        c, t = global_accuracy_counts(logits, labels, ignore_index=IGNORE_LABEL_ID)
-        correct_all += float(c); total_all += float(t)
+        sum_count += float(last_metrics["count"])
+        sum_acc += float(last_metrics["accuracy"])
+        sum_exact += float(last_metrics["exact_accuracy"])
 
-        c, t = exact_accuracy_counts(logits, labels, ignore_index=IGNORE_LABEL_ID)
-        correct_exact += float(c); total_exact += float(t)
+        sum_lm_loss += float(last_metrics["lm_loss"])
+        sum_q_halt_loss += float(last_metrics["q_halt_loss"])
+        sum_total_loss += float(last_loss.item())
 
         if rank == 0:
-            running_loss = loss_sum_seqmeans / max(seq_count, 1.0)
+            running_acc = sum_acc / max(sum_count, 1.0)
+            running_exact = sum_exact / max(sum_count, 1.0)
+            running_lm = sum_lm_loss / max(sum_count, 1.0)
             bar.set_postfix({
-                "loss": f"{running_loss:.4f}",
-                "blank_acc": f"{(correct_blank / max(total_blank, 1.0)):.3f}",
+                "lm_loss": f"{running_lm:.4f}",
+                "acc": f"{running_acc:.3f}",
+                "exact": f"{running_exact:.3f}",
             })
 
     bar.close()
 
     totals = ddp_sum_metrics(
         {
-            "loss_sum_seqmeans": loss_sum_seqmeans,
-            "seq_count": seq_count,
-            "correct_all": correct_all,
-            "total_all": total_all,
-            "correct_exact": correct_exact,
-            "total_exact": total_exact,
+            "count": sum_count,
+            "accuracy": sum_acc,
+            "exact_accuracy": sum_exact,
+            "lm_loss": sum_lm_loss,
+            "q_halt_loss": sum_q_halt_loss,
+            "total_loss": sum_total_loss,
         },
         device=device,
     )
 
-    loss_sum_seqmeans = totals["loss_sum_seqmeans"]
-    seq_count = totals["seq_count"]
+    count = max(totals["count"], 1.0)
 
-    correct_all = totals["correct_all"]; total_all = totals["total_all"]
-    correct_exact = totals["correct_exact"]; total_exact = totals["total_exact"]
+    avg_lm_loss = totals["lm_loss"] / count
+    avg_q_halt_loss = totals["q_halt_loss"] / count
+    avg_total_loss = totals["total_loss"] / count
 
-    avg_loss = loss_sum_seqmeans / max(seq_count, 1.0)
-    acc_all = float(correct_all / max(total_all, 1.0))
-    acc_exact = float(correct_exact / max(total_exact, 1.0))
+    acc_all = totals["accuracy"] / count
+    acc_exact = totals["exact_accuracy"] / count
 
-    return avg_loss, acc_all, acc_exact
+    return float(avg_lm_loss), float(acc_all), float(acc_exact), float(avg_q_halt_loss), float(avg_total_loss)
 
 
 
@@ -622,6 +618,7 @@ def main(hydra_cfg: DictConfig):
         model = torch.compile(model)
         if is_main:
             print("[model] compile enabled")
+    loss_head = ACTLossHead(model)
 
     opt = torch.optim.AdamW(
         model.parameters(),
@@ -691,10 +688,9 @@ def main(hydra_cfg: DictConfig):
     for epc in master_bar:
         step = train_one_epoch(
             model,
+            loss_head,
             train_loader,
             device,
-            episodes=episodes,
-            blank_id=cfg.blank_id,
             base_lr=cfg.lr,
             warmup=cfg.lr_warmup_steps,
             total_steps=total_steps,
@@ -703,51 +699,44 @@ def main(hydra_cfg: DictConfig):
             opt=opt,
             use_wandb=use_wandb,
             epoch=epc,
-            total_epochs=cfg.epochs,
-            total_train_batches=steps_per_epoch,
             global_batch_size=cfg.global_batch_size,
             rank=rank,
         )
 
-        # Eval only on rank 0 (simple + correct)
         if eval_loader is not None and ((epc + 1) % max(1, cfg.eval_interval) == 0):
-            eval_loss, eval_acc_all, eval_acc_blank, eval_acc_exact = evaluate(
-                model,
+            eval_lm_loss, eval_acc_all, eval_acc_exact, eval_q_halt_loss, avg_total_loss = evaluate(
+                loss_head,
                 eval_loader,
                 device,
-                episodes_eval=episodes,
-                blank_id=cfg.blank_id,
                 max_batches=cfg.max_eval_batches,
-                epoch=epc,
-                total_epochs=cfg.epochs,
                 rank=rank,
             )
             if is_main:
                 if use_wandb:
                     wandb.log({
-                        "all.lm_loss": eval_loss,
+                        "all.lm_loss": eval_lm_loss,
+                        "all.q_halt_loss":eval_q_halt_loss,
+                        "all.total_loss": avg_total_loss,
                         "all.accuracy": eval_acc_all,
-                        "all.exact_accuracy"
+                        "all.exact_accuracy": eval_acc_exact,
                         "epoch": epc + 1,
                         "global_step": step,
                     })
                     master_bar.set_postfix({
                         "eval_epoch": f"{epc+1}/{cfg.epochs}",
-                        "eval_loss": f"{eval_loss:.4f}",
+                        "eval_lm_loss": f"{eval_lm_loss:.4f}",
                         "eval_acc": f"{eval_acc_exact:.3f}"
                     })
 
-            current = eval_acc_blank if cfg.best_metric == "eval_acc_blank" else eval_loss
+            current = eval_acc_exact if cfg.best_metric == "eval_acc_exact" else eval_lm_loss
             better = (best_score is None) or ((cfg.best_mode == "max" and current > best_score) or (cfg.best_mode == "min" and current < best_score))
             if better and cfg.save_best:
                 best_score = current
                 save_checkpoint(best_ckpt, model, opt, epc, step, cfg, best_score=best_score)
 
-        # Save last checkpoint on rank 0
         if is_main and ((epc + 1) % max(1, cfg.save_every) == 0):
             save_checkpoint(last_ckpt, model, opt, epc, step, cfg, best_score=best_score)
 
-    # Final save + shutdown
     if is_main:
         save_checkpoint(last_ckpt, model, opt, cfg.epochs - 1, step, cfg, best_score=best_score)
         if use_wandb:

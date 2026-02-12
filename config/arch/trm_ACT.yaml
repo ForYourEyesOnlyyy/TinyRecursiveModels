@@ -1,0 +1,27 @@
+# ---------- model wiring ----------
+name: recursive_reasoning.TRM_ACT@TRM_ACT
+forward_dtype: bfloat16
+
+
+# ---------- backbone ----------
+hidden_size: 512
+num_heads: 8
+expansion: 4
+dropout: 0.1
+n_layers: 1
+
+# ---------- recursion ----------
+S_steps: 1           
+R_steps: 1   
+
+# ---------- recursion ----------
+scale_input_injection: True
+state_scale_init: 0.1  
+
+pos_encodings: rope
+rope_theta: 10000.0
+
+# ------------- ACT -------------
+halt_max_steps: 16
+halt_exploration_prob: 0.1
+no_ACT_continue: true

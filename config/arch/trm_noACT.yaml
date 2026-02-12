@@ -1,5 +1,5 @@
 # ---------- model wiring ----------
-name: recursive_reasoning.double_cycle@TRM
+name: recursive_reasoning.TRM_noACT@TRM
 forward_dtype: bfloat16
 
 

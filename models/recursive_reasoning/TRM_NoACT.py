@@ -6,7 +6,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pydantic import BaseModel, ValidationError
+from pydantic import ConfigDict, BaseModel, ValidationError
 
 from models.common import trunc_normal_init_
 from models.layers import (
@@ -28,6 +28,7 @@ class TRMCarry:
     Z_R: torch.Tensor   # Reasoning latent (fast state)
 
 class TRMConfig(BaseModel): 
+    model_config = ConfigDict(extra="allow")
     # data / vocab
     forward_dtype: str = "bfloat16"
     seq_len: int                    # 81 for Sudoku
