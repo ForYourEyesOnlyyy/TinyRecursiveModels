@@ -139,14 +139,23 @@ def broadcast_objects(obj_list: list, src: int = 0):
 
 
 def allreduce_grads(model: nn.Module):
-    """Average gradients across ranks (manual DDP)."""
+    """Average gradients across ranks (manual DDP), safe if some grads are None."""
     if not dist.is_initialized():
         return
+
     world_size = dist.get_world_size()
     for p in model.parameters():
-        if p.grad is not None:
-            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-            p.grad.div_(world_size)
+        if not p.requires_grad:
+            continue
+
+        if p.grad is None:
+            grad = torch.zeros_like(p, device=p.device, dtype=p.dtype)
+            dist.all_reduce(grad, op=dist.ReduceOp.SUM)
+            continue
+
+        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+        p.grad.div_(world_size)
+        
 
 def ddp_sum_metrics(metrics: Dict[str, float], device: torch.device) -> Dict[str, float]:
     """
@@ -476,7 +485,16 @@ def train_one_epoch(
 
             step += 1
 
-            if bool(all_finish):
+            local_done = carry.halted.all()
+
+            if dist.is_initialized():
+                done_flag = torch.tensor([int(local_done)], device=device, dtype=torch.int32)
+                dist.all_reduce(done_flag, op=dist.ReduceOp.MIN)
+                global_done = bool(done_flag.item())
+            else:
+                global_done = bool(local_done)
+
+            if global_done:
                 break
 
         final_logits = carry.last_logits  # [B,L,V]
@@ -715,7 +733,14 @@ def main(hydra_cfg: DictConfig):
             rank=rank,
         )
 
-        if eval_loader is not None and ((epc + 1) % max(1, cfg.eval_interval) == 0):
+        do_eval = (eval_loader is not None) and ((epc + 1) % max(1, cfg.eval_interval) == 0)
+
+        if dist.is_initialized():
+            flag = torch.tensor([int(do_eval)], device=device, dtype=torch.int32)
+            dist.all_reduce(flag, op=dist.ReduceOp.MIN)   # if any rank is 0 -> all become 0
+            do_eval = bool(flag.item())
+
+        if do_eval:
             eval_lm_loss, eval_acc_all, eval_acc_exact, eval_q_halt_loss, avg_total_loss = evaluate(
                 model,
                 loss_head,
@@ -724,28 +749,38 @@ def main(hydra_cfg: DictConfig):
                 max_batches=cfg.max_eval_batches,
                 rank=rank,
             )
-            if is_main:
-                if use_wandb:
-                    wandb.log({
-                        "all.lm_loss": eval_lm_loss,
-                        "all.q_halt_loss":eval_q_halt_loss,
-                        "all.total_loss": avg_total_loss,
-                        "all.accuracy": eval_acc_all,
-                        "all.exact_accuracy": eval_acc_exact,
-                        "epoch": epc + 1,
-                        "global_step": step,
-                    })
-                    master_bar.set_postfix({
-                        "eval_epoch": f"{epc+1}/{cfg.epochs}",
-                        "eval_lm_loss": f"{eval_lm_loss:.4f}",
-                        "eval_acc": f"{eval_acc_exact:.3f}"
-                    })
 
-            current = eval_acc_exact if cfg.best_metric == "eval_acc_exact" else eval_lm_loss
-            better = (best_score is None) or ((cfg.best_mode == "max" and current > best_score) or (cfg.best_mode == "min" and current < best_score))
-            if better and cfg.save_best:
-                best_score = current
-                save_checkpoint(best_ckpt, model, opt, epc, step, cfg, best_score=best_score)
+            if is_main and use_wandb:
+                wandb.log({
+                    "all.lm_loss": eval_lm_loss,
+                    "all.q_halt_loss": eval_q_halt_loss,
+                    "all.total_loss": avg_total_loss,
+                    "all.accuracy": eval_acc_all,
+                    "all.exact_accuracy": eval_acc_exact,
+                    "epoch": epc + 1,
+                    "global_step": step,
+                })
+                master_bar.set_postfix({
+                    "eval_epoch": f"{epc+1}/{cfg.epochs}",
+                    "eval_lm_loss": f"{eval_lm_loss:.4f}",
+                    "eval_acc": f"{eval_acc_exact:.3f}",
+                })
+
+            if is_main:
+                if cfg.best_metric == "eval_acc_exact":
+                    current = eval_acc_exact
+                elif cfg.best_metric == "eval_acc_all":
+                    current = eval_acc_all
+                else:
+                    current = eval_lm_loss
+
+                better = (best_score is None) or (
+                    (cfg.best_mode == "max" and current > best_score) or
+                    (cfg.best_mode == "min" and current < best_score)
+                )
+                if better and cfg.save_best:
+                    best_score = current
+                    save_checkpoint(best_ckpt, model, opt, epc, step, cfg, best_score=best_score)
 
         if is_main and ((epc + 1) % max(1, cfg.save_every) == 0):
             save_checkpoint(last_ckpt, model, opt, epc, step, cfg, best_score=best_score)
