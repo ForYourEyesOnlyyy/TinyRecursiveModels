@@ -15,58 +15,73 @@ IGNORE_LABEL_ID = -100
 @dataclass
 class TRM_RtifyCarry:
     """
-    Fixed-batch carry, ACT-like.
+    Fixed-batch carry for RTify-style halting.
 
-    - inner_carry: TRM latent state (Z_S/Z_R)
-    - steps: per-sample step counter
-    - halted: per-sample halted mask
-    - last_logits: frozen logits for halted samples
-    - phi: accumulated evidence Φ
+    - inner_carry  : TRM latent state (Z_S / Z_R)
+    - steps        : per-sample step counter            [B] int32
+    - halted       : per-sample halted mask             [B] bool
+    - last_logits  : frozen logits for halted samples   [B, L, V] float32
+    - phi          : accumulated evidence Φ             [B] float32
     """
-    inner_carry: TRMCarry
-    steps: torch.Tensor        # [B] int32
-    halted: torch.Tensor       # [B] bool
-    last_logits: torch.Tensor  # [B,L,V] float32
-    phi: torch.Tensor          # [B] float32
+    inner_carry:  TRMCarry
+    steps:        torch.Tensor
+    halted:       torch.Tensor
+    last_logits:  torch.Tensor
+    phi:          torch.Tensor
 
 
 class TRMRtifyConfig(TRMConfig):
     """
-    TRMConfig + Rtify halting fields.
+    TRMConfig extended with RTify halting fields.
 
-    We keep the interface similar to ACT:
-      - halt_max_steps: max steps allowed
-      - theta_init: initial threshold
-      - detach_fw_input: whether fw sees detached z (recommended True)
-      - train_fixed_steps: if True, do NOT early-halt during training (DDP-safe)
+    theta_init is derived from the expected Softplus(0) = log(2) ≈ 0.693
+    value emitted by fw at random initialisation.  Setting theta_init to
+    (2/3 * halt_max_steps * log(2)) makes the model halt at roughly the
+    2/3 point initially, giving the task loss time to stabilise before
+    the halting signal becomes active.
     """
     model_config = ConfigDict(extra="allow")
 
     halt_max_steps: int = 16
 
-    theta_init: float = 8.0
-    train_theta: bool = False          # if False, theta is frozen
-    theta_reg: float = 0.0             # optional: encourage smaller theta if train_theta
+    # θ ≈ (2/3 * halt_max_steps * log(2)) at random init → halts at ~2/3 of steps
+    theta_init: float = 7.4          # for halt_max_steps=16: (2/3)*16*ln(2) ≈ 7.4
+    train_theta: bool = False        # if False, theta is a frozen buffer
+    # NOTE: if train_theta=True, use a separate, smaller lr for theta
+    # (≈ 0.1 × main lr), because ∂τ/∂θ ≈ 1/log(2) ≈ 1.44 at init,
+    # so theta moves fast relative to other parameters.
 
-    detach_fw_input: bool = True       # fw reads z.detach()
-    train_fixed_steps: bool = True     # DDP-safe: only halt by max steps during training
+    detach_fw_input: bool = True     # fw reads z.detach() — prevents halt
+                                     # gradients from reshaping Z_S
+    train_fixed_steps: bool = True   # DDP-safe: disable threshold halting
+                                     # during training; only halt at max steps
 
-    # evidence net shape
-    fw_hidden_mult: float = 1.0        # hidden size multiplier inside fw MLP
+    fw_hidden_mult: float = 1.0      # hidden-size multiplier inside fw MLP
 
 
 class TRM_Rtify(nn.Module):
     """
-    TRM + monotone evidence halting wrapper (RTiFy-style, hard threshold).
+    TRM + RTify-style monotone evidence halting.
 
-    One call = ONE reasoning step.
+    One call to forward() = ONE reasoning step (supervision episode).
 
-    Training:
-      - usually run fixed number of steps (train_fixed_steps=True) to keep DDP aligned
-      - loss head trains fw via readiness BCE + evidence penalty
+    Evidence network fw:
+        e_m = Softplus(fw(z_summary_m))   > 0  always
+        Φ_m = Φ_{m-1} + e_m              strictly increasing
 
-    Inference/Eval:
-      - can halt early when Φ > θ (if you set train_fixed_steps=False or run in eval mode)
+    Halt condition (inference / train_fixed_steps=False):
+        halt when Φ_m >= θ  OR  steps >= halt_max_steps
+
+    Training loss (added by RTifyLossHead, not here):
+        L_m = CE(logits_m, y) + λ * e_m
+
+    Penalising e_m at every step implicitly penalises the stopping time
+    because Φ is the cumulative sum of evidence — no survival function,
+    no Taylor approximation, no RL required.
+
+    z_summary is the MEAN of Z_S over the sequence dimension.  Using the
+    mean rather than a single token makes the readiness signal robust to
+    positional accidents and gives fw a richer input.
     """
 
     def __init__(self, cfg_dict: Dict):
@@ -81,7 +96,8 @@ class TRM_Rtify(nn.Module):
         D = self.config.hidden_size
         H = int(self.config.fw_hidden_mult * D)
 
-        # Evidence network outputs a logit g; evidence is Softplus(g) > 0
+        # Evidence network: Z_S mean -> positive scalar evidence e > 0
+        # g is the pre-Softplus logit; e = Softplus(g)
         self.fw_fc1 = CastedLinear(D, H, bias=True)
         self.fw_fc2 = CastedLinear(H, 1, bias=True)
 
@@ -92,8 +108,9 @@ class TRM_Rtify(nn.Module):
         else:
             self.register_buffer("theta", theta, persistent=True)
 
+
     def initial_carry(self, batch: Dict[str, torch.Tensor]) -> TRM_RtifyCarry:
-        B = batch["inputs"].shape[0]
+        B      = batch["inputs"].shape[0]
         device = batch["inputs"].device
 
         inner_carry = self.inner.init_carry(B, device)
@@ -105,72 +122,85 @@ class TRM_Rtify(nn.Module):
         )
 
         return TRM_RtifyCarry(
-            inner_carry=inner_carry,
-            steps=torch.zeros((B,), device=device, dtype=torch.int32),
-            halted=torch.zeros((B,), device=device, dtype=torch.bool),
-            last_logits=last_logits,
-            phi=torch.zeros((B,), device=device, dtype=torch.float32),
+            inner_carry = inner_carry,
+            steps       = torch.zeros((B,), device=device, dtype=torch.int32),
+            halted      = torch.zeros((B,), device=device, dtype=torch.bool),
+            last_logits = last_logits,
+            phi         = torch.zeros((B,), device=device, dtype=torch.float32),
         )
 
-    def _fw(self, z_summary: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-          g: [B] logit (for readiness BCE)
-          e: [B] positive evidence (Softplus)
-        """
-        h = F.relu(self.fw_fc1(z_summary))
-        g = self.fw_fc2(h).squeeze(-1)          # [B]
-        e = F.softplus(g)                       # [B] > 0
-        return g, e
 
-    def forward(self, carry: TRM_RtifyCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TRM_RtifyCarry, Dict[str, torch.Tensor]]:
+    def _fw(self, z_summary: torch.Tensor) -> torch.Tensor:
+        """
+        Map a [B, D] hidden summary to per-sample positive evidence e ∈ (0, ∞).
+
+        Returns:
+            e : [B]  Softplus output, strictly positive
+        """
+        h = F.relu(self.fw_fc1(z_summary))      # [B, H]
+        g = self.fw_fc2(h).squeeze(-1)           # [B]
+        e = F.softplus(g)                        # [B]  > 0
+        return e
+
+
+    def forward(
+        self,
+        carry: TRM_RtifyCarry,
+        batch: Dict[str, torch.Tensor],
+    ) -> Tuple[TRM_RtifyCarry, Dict[str, torch.Tensor]]:
+
         inputs = batch["inputs"]
 
         new_inner_carry, logits = self.inner(inputs, carry.inner_carry)
-        logits = logits.to(torch.float32)  # [B,L,V]
+        logits = logits.to(torch.float32)        # [B, L, V]
 
-        # evidence from Z_S summary token 0
-        z_summary = new_inner_carry.Z_S[:, 0]  # [B,D]
+        z_summary = new_inner_carry.Z_S.mean(dim=1)   # [B, D]
         if self.config.detach_fw_input:
             z_summary = z_summary.detach()
 
-        g, e = self._fw(z_summary)  # g:[B], e:[B]
+        e = self._fw(z_summary)                  # [B]  > 0, in compute graph
 
         with torch.no_grad():
-            prev_halted = carry.halted
-            steps = torch.where(prev_halted, carry.steps, carry.steps + 1)
+            prev_halted = carry.halted           # [B] bool
 
-            phi = torch.where(prev_halted, carry.phi, carry.phi + e.to(torch.float32))
+            active  = ~prev_halted               # [B] bool
+            steps   = carry.steps + active.to(torch.int32)   # [B]
+
+            phi = carry.phi + torch.where(
+                active,
+                e.to(torch.float32),
+                torch.zeros_like(e),
+            )                                    # [B]
 
             halted = steps >= int(self.config.halt_max_steps)
+
             allow_threshold = (not self.training) or (not self.config.train_fixed_steps)
             if allow_threshold:
                 halted = halted | (phi >= self.theta)
 
-            halted = prev_halted | halted
-            just_halted = (~prev_halted) & halted
+            halted     = prev_halted | halted    # [B]
+            just_halted = (~prev_halted) & halted  # [B]  first time halting
 
-        
-        freeze_mask = prev_halted.view(-1, 1, 1)  # [B,1,1]
+        freeze_mask = prev_halted.view(-1, 1, 1)   # [B, 1, 1]
 
         frozen_logits = torch.where(freeze_mask, carry.last_logits, logits)
         ZS = torch.where(freeze_mask, carry.inner_carry.Z_S, new_inner_carry.Z_S)
         ZR = torch.where(freeze_mask, carry.inner_carry.Z_R, new_inner_carry.Z_R)
 
         new_carry = TRM_RtifyCarry(
-            inner_carry=TRMCarry(Z_S=ZS, Z_R=ZR),
-            steps=steps,
-            halted=halted,
-            last_logits=frozen_logits,
-            phi=phi,
+            inner_carry = TRMCarry(Z_S=ZS, Z_R=ZR),
+            steps       = steps,
+            halted      = halted,
+            last_logits = frozen_logits,
+            phi         = phi,
         )
 
         outputs = {
-            "logits": frozen_logits,     # [B,L,V]
-            "g_logit": g,                # [B]
-            "evidence": e,               # [B] > 0
-            "phi": phi,                  # [B]
-            "theta": self.theta,         # scalar tensor
-            "just_halted": just_halted,  # [B]
+            "logits":      frozen_logits,   # [B, L, V]
+            "evidence":    e,               # [B]  > 0, in compute graph
+            "active":      active,          # [B]  bool — which samples contributed
+            "phi":         phi,             # [B]  accumulated Φ (detached)
+            "theta":       self.theta,      # scalar tensor
+            "just_halted": just_halted,     # [B]  bool
         }
         return new_carry, outputs
