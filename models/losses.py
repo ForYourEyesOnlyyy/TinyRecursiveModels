@@ -125,3 +125,97 @@ class ACTLossHead(nn.Module):
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs} if return_keys else None
         all_finish = new_carry.halted.all()
         return new_carry, total_loss, metrics, detached_outputs, all_finish
+    
+
+class RTifyLossHead(nn.Module):
+
+    def __init__(self, model, loss_type="stablemax_cross_entropy"):
+        super().__init__()
+
+        self.model = model
+        self.loss_fn = globals()[loss_type]
+
+        self.lambda_halt = model.config.lambda_halt
+
+
+    def forward(
+        self,
+        *,
+        carry,
+        batch,
+        return_keys=(),
+    ):
+
+        new_carry, outputs = self.model(carry=carry, batch=batch)
+
+        labels = batch["labels"]
+        logits = outputs["logits"]
+        evidence = outputs["evidence"]
+        phi = outputs["phi"]
+        theta = outputs["theta"]
+
+        mask = (labels != IGNORE_LABEL_ID)
+
+        loss_counts = mask.sum(-1)
+        loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)
+
+        lm_loss = (
+            self.loss_fn(
+                logits,
+                labels,
+                ignore_index=IGNORE_LABEL_ID,
+                valid_mask=mask,
+            ) / loss_divisor
+        ).sum()
+
+        halt_penalty = self.lambda_halt * evidence.sum()
+        total_loss = lm_loss + halt_penalty
+
+        with torch.no_grad():
+
+            preds = logits.argmax(-1)
+
+            is_correct = mask & (preds == labels)
+
+            seq_is_correct = (
+                is_correct.sum(-1) == loss_counts
+            )
+
+            just_halted = outputs["just_halted"]
+
+            valid_metrics = just_halted & (loss_counts > 0)
+
+            metrics = {
+                "count": valid_metrics.sum(),
+                "accuracy": torch.where(
+                    valid_metrics,
+                    (is_correct.float() / loss_divisor).sum(-1),
+                    0
+                ).sum(),
+                "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
+                "lm_loss": lm_loss.detach(),
+                "halt_penalty": halt_penalty.detach(),
+                "steps_sum": torch.where(
+                    valid_metrics,
+                    new_carry.steps.float(),
+                    0
+                ).sum(),
+
+                "phi_sum": torch.where(
+                    valid_metrics,
+                    phi,
+                    0
+                ).sum(),
+
+                "theta": theta.detach(),
+            }
+
+        detached_outputs = {
+            k: outputs[k].detach()
+            for k in return_keys
+            if k in outputs
+        }
+
+        all_finish = new_carry.halted.all()
+
+        return new_carry, total_loss, metrics, detached_outputs, all_finish
