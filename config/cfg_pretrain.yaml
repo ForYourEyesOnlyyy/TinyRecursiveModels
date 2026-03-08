@@ -10,6 +10,7 @@ data_split_train: "train"
 data_split_eval: "test"
 blank_id: 1
 global_batch_size: 256              # total examples per batch (single GPU)
+max_eval_batches: 4
 
 # optimizer
 lr: 1e-4

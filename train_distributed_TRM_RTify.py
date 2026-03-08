@@ -21,7 +21,7 @@ from utils.functions import load_model_class
 from utils.wandb import build_run_name, build_arch_tags
 from models.losses import IGNORE_LABEL_ID
 from models.losses import RTifyLossHead
-from models.recursive_reasoning.TRM_RTify import TRM_RTifyCarry
+from models.recursive_reasoning.TRM_RTify import TRM_RtifyCarry
 from models.recursive_reasoning.TRM_NoACT import TRMCarry
 
 import warnings
@@ -420,7 +420,7 @@ def train_one_rtify_step(
 
     opt.step()
 
-    new_carry = TRM_RTifyCarry(
+    new_carry = TRM_RtifyCarry(
         inner_carry=TRMCarry(
             Z_S=new_carry.inner_carry.Z_S.detach(),
             Z_R=new_carry.inner_carry.Z_R.detach(),
@@ -518,6 +518,7 @@ def train_one_epoch(
             wandb.log({
                 "train/lm_loss": float(last_metrics["lm_loss"]) / global_batch_size,
                 "train/halt_penalty": float(last_metrics["halt_penalty"]) / global_batch_size,
+                # "train/readiness": float(last_metrics["readiness"]) / global_batch_size,
                 "train/accuracy": acc,
                 "train/exact_accuracy": acc_exact,
 
@@ -701,7 +702,7 @@ def main(hydra_cfg: DictConfig):
 
         wandb.define_metric("global_step")
         wandb.define_metric("*", step_metric="global_step")
-        wandb.watch(model)
+        wandb.watch(model, log="parameters", log_freq=100)
         print(f"[W&B] enabled (rank0) run={wandb.run.name if wandb.run else 'None'}")
     elif is_main:
         print("[W&B] disabled")

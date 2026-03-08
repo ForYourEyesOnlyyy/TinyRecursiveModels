@@ -57,6 +57,8 @@ class TRMRtifyConfig(TRMConfig):
                                      # during training; only halt at max steps
 
     fw_hidden_mult: float = 1.0      # hidden-size multiplier inside fw MLP
+    lambda_halt: float = 1e-3
+    lambda_ready: float = 0.1
 
 
 class TRM_Rtify(nn.Module):
@@ -140,7 +142,7 @@ class TRM_Rtify(nn.Module):
         h = F.relu(self.fw_fc1(z_summary))      # [B, H]
         g = self.fw_fc2(h).squeeze(-1)           # [B]
         e = F.softplus(g)                        # [B]  > 0
-        return e
+        return g, e
 
 
     def forward(
@@ -158,7 +160,7 @@ class TRM_Rtify(nn.Module):
         if self.config.detach_fw_input:
             z_summary = z_summary.detach()
 
-        e = self._fw(z_summary)                  # [B]  > 0, in compute graph
+        g, e = self._fw(z_summary)                  # [B]  > 0, in compute graph
 
         with torch.no_grad():
             prev_halted = carry.halted           # [B] bool
@@ -197,6 +199,7 @@ class TRM_Rtify(nn.Module):
 
         outputs = {
             "logits":      frozen_logits,   # [B, L, V]
+            "g_logit":     g,
             "evidence":    e,               # [B]  > 0, in compute graph
             "active":      active,          # [B]  bool — which samples contributed
             "phi":         phi,             # [B]  accumulated Φ (detached)

@@ -145,6 +145,8 @@ class RTifyLossHead(nn.Module):
         self.loss_fn  = globals()[loss_type]
 
         self.lambda_halt = float(model.config.lambda_halt)
+        self.lambda_ready = model.config.lambda_ready
+
 
     def forward(
         self,
@@ -158,6 +160,7 @@ class RTifyLossHead(nn.Module):
 
         labels   = batch["labels"]
         logits   = outputs["logits"]     # [B, L, V]
+        # g_logit  = outputs['g_logit']
         evidence = outputs["evidence"]   # [B]  > 0, in compute graph
         active   = outputs["active"]     # [B]  bool: samples that ran this step
         phi      = outputs["phi"]        # [B]  detached Φ
@@ -176,6 +179,20 @@ class RTifyLossHead(nn.Module):
             ) / loss_divisor
         ).sum()
 
+        # with torch.no_grad():
+        #     preds          = logits.argmax(-1)                        # [B, L]
+        #     is_correct     = mask & (preds == labels)                 # [B, L]
+        #     seq_is_correct = (is_correct.sum(-1) == loss_counts)      # [B]
+            # seq_correct    = seq_is_correct.float()                   # [B] for BCE
+
+
+        # readiness_loss = F.binary_cross_entropy_with_logits(
+        #     outputs["g_logit"],
+        #     seq_correct,
+        #     reduction="mean",
+        # )
+        # readiness_penalty = self.lambda_ready * readiness_loss
+
         # ── Halt penalty ───────────────────────────────────────────────
         # Only penalise evidence from ACTIVE (not yet halted) samples.
         # Halted samples froze their state; their fw still runs but we
@@ -185,6 +202,7 @@ class RTifyLossHead(nn.Module):
         halt_penalty = self.lambda_halt * (evidence * active.float()).sum() / n_active
 
         total_loss = lm_loss + halt_penalty
+        # total_loss = lm_loss + halt_penalty + readiness_penalty
 
         with torch.no_grad():
             preds          = logits.argmax(-1)              # [B, L]
@@ -205,6 +223,7 @@ class RTifyLossHead(nn.Module):
 
                 "lm_loss":        lm_loss.detach(),
                 "halt_penalty":   halt_penalty.detach(),
+                # "readiness":      readiness_penalty.detach(),
 
                 "steps_sum":      torch.where(valid_metrics, new_carry.steps.float(), 0.0).sum(),
                 "phi_sum":        torch.where(valid_metrics, phi, 0.0).sum(),

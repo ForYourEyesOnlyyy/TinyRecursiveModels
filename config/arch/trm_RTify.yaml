@@ -1,5 +1,5 @@
 # ---------- model wiring ----------
-name: recursive_reasoning.TRM_ACT@TRM_ACT
+name: recursive_reasoning.TRM_RTify@TRM_Rtify
 forward_dtype: bfloat16
 
 
@@ -21,11 +21,12 @@ state_scale_init: 0.1
 pos_encodings: rope
 rope_theta: 10000.0
 
-# ------------- ACT -------------
+# ------------- RTify -------------
 halt_max_steps: 16
-theta_init: 7.4
+theta_init: 5
 train_theta: True        
-theta_reg: 0.0  
-detach_fw_input: True     
-train_fixed_steps: True 
-fw_hidden_mult: 1.0   
+detach_fw_input: False     
+train_fixed_steps: False 
+fw_hidden_mult: 1.0  
+lambda_halt: 1e-5 
+lambda_ready: 0.1
