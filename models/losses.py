@@ -160,7 +160,7 @@ class RTifyLossHead(nn.Module):
 
         labels   = batch["labels"]
         logits   = outputs["logits"]     # [B, L, V]
-        # g_logit  = outputs['g_logit']
+        g_logit  = outputs['g_logit']
         evidence = outputs["evidence"]   # [B]  > 0, in compute graph
         active   = outputs["active"]     # [B]  bool: samples that ran this step
         phi      = outputs["phi"]        # [B]  detached Φ
@@ -179,19 +179,22 @@ class RTifyLossHead(nn.Module):
             ) / loss_divisor
         ).sum()
 
-        # with torch.no_grad():
-        #     preds          = logits.argmax(-1)                        # [B, L]
-        #     is_correct     = mask & (preds == labels)                 # [B, L]
-        #     seq_is_correct = (is_correct.sum(-1) == loss_counts)      # [B]
-            # seq_correct    = seq_is_correct.float()                   # [B] for BCE
+        with torch.no_grad():
+            preds          = logits.argmax(-1)                        # [B, L]
+            is_correct     = mask & (preds == labels)                 # [B, L]
+            seq_is_correct = (is_correct.sum(-1) == loss_counts)      # [B]
+            seq_correct = is_correct.float().sum(-1) / loss_counts.float()                  # [B] for BCE
 
 
-        # readiness_loss = F.binary_cross_entropy_with_logits(
-        #     outputs["g_logit"],
-        #     seq_correct,
-        #     reduction="mean",
-        # )
-        # readiness_penalty = self.lambda_ready * readiness_loss
+        n_active = active.float().sum().clamp_min(1.0)
+        readiness_loss = F.binary_cross_entropy_with_logits(
+            g_logit,
+            seq_correct,
+            weight=active.float(), 
+            reduction="sum",
+        ) / n_active
+
+        readiness_penalty = self.lambda_ready * readiness_loss
 
         # ── Halt penalty ───────────────────────────────────────────────
         # Only penalise evidence from ACTIVE (not yet halted) samples.
@@ -201,13 +204,13 @@ class RTifyLossHead(nn.Module):
         n_active     = active.float().sum().clamp_min(1.0)
         halt_penalty = self.lambda_halt * (evidence * active.float()).sum() / n_active
 
-        total_loss = lm_loss + halt_penalty
-        # total_loss = lm_loss + halt_penalty + readiness_penalty
+        # total_loss = lm_loss + halt_penalty
+        total_loss = lm_loss + halt_penalty + readiness_penalty
 
         with torch.no_grad():
-            preds          = logits.argmax(-1)              # [B, L]
-            is_correct     = mask & (preds == labels)       # [B, L]
-            seq_is_correct = (is_correct.sum(-1) == loss_counts)  # [B]
+            # preds          = logits.argmax(-1)              # [B, L]
+            # is_correct     = mask & (preds == labels)       # [B, L]
+            # seq_is_correct = (is_correct.sum(-1) == loss_counts)  # [B]
 
             just_halted   = outputs["just_halted"]          # [B]
             valid_metrics = just_halted & (loss_counts > 0) # [B]
@@ -223,7 +226,7 @@ class RTifyLossHead(nn.Module):
 
                 "lm_loss":        lm_loss.detach(),
                 "halt_penalty":   halt_penalty.detach(),
-                # "readiness":      readiness_penalty.detach(),
+                "readiness":      readiness_penalty.detach(),
 
                 "steps_sum":      torch.where(valid_metrics, new_carry.steps.float(), 0.0).sum(),
                 "phi_sum":        torch.where(valid_metrics, phi, 0.0).sum(),

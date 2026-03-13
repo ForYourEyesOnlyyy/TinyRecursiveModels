@@ -43,6 +43,7 @@ class TRMRtifyConfig(TRMConfig):
     model_config = ConfigDict(extra="allow")
 
     halt_max_steps: int = 16
+    halt_warmup_steps: int = 1000
 
     # θ ≈ (2/3 * halt_max_steps * log(2)) at random init → halts at ~2/3 of steps
     theta_init: float = 7.4          # for halt_max_steps=16: (2/3)*16*ln(2) ≈ 7.4
@@ -176,7 +177,8 @@ class TRM_Rtify(nn.Module):
 
             halted = steps >= int(self.config.halt_max_steps)
 
-            allow_threshold = (not self.training) or (not self.config.train_fixed_steps)
+            force_fixed = batch.get("force_fixed_steps", False)
+            allow_threshold = (not self.training or not self.config.train_fixed_steps) and not force_fixed
             if allow_threshold:
                 halted = halted | (phi >= self.theta)
 

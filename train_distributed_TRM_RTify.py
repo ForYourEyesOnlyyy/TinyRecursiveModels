@@ -401,13 +401,15 @@ def train_one_rtify_step(
     carry,
     opt,
     *,
-    global_batch_size
+    global_batch_size,
+    global_step
 ):
+    in_warmup = global_step < model.config.halt_warmup_steps
 
     new_carry, loss, metrics, _, all_finish = loss_head(
         carry=carry,
-        batch=batch,
-        return_keys=[]
+        batch={**batch, "force_fixed_steps": in_warmup},
+        return_keys=(),
     )
 
     opt.zero_grad(set_to_none=True)
@@ -483,6 +485,7 @@ def train_one_epoch(
                 carry,
                 opt,
                 global_batch_size=global_batch_size,
+                global_step=epoch+1
             )
 
             last_metrics = metrics
@@ -518,7 +521,7 @@ def train_one_epoch(
             wandb.log({
                 "train/lm_loss": float(last_metrics["lm_loss"]) / global_batch_size,
                 "train/halt_penalty": float(last_metrics["halt_penalty"]) / global_batch_size,
-                # "train/readiness": float(last_metrics["readiness"]) / global_batch_size,
+                "train/readiness": float(last_metrics["readiness"]) / global_batch_size,
                 "train/accuracy": acc,
                 "train/exact_accuracy": acc_exact,
 

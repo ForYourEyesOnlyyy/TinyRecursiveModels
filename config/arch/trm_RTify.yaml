@@ -23,6 +23,7 @@ rope_theta: 10000.0
 
 # ------------- RTify -------------
 halt_max_steps: 16
+halt_warmup_steps: 1000 
 theta_init: 5
 train_theta: True        
 detach_fw_input: False     
