@@ -394,6 +394,10 @@ def exact_accuracy_counts(
 
     return int(correct_exact), int(total_exact)
 
+# ------------------------------------------------------------
+# Train epoch
+# ------------------------------------------------------------
+
 def train_one_rtify_step(
     loss_head,
     model,
@@ -405,23 +409,23 @@ def train_one_rtify_step(
     global_step
 ):
     in_warmup = global_step < model.config.halt_warmup_steps
-
+ 
     new_carry, loss, metrics, _, all_finish = loss_head(
         carry=carry,
         batch={**batch, "force_fixed_steps": in_warmup},
         return_keys=(),
     )
-
+ 
     opt.zero_grad(set_to_none=True)
-
+ 
     (loss / global_batch_size).backward()
-
+ 
     allreduce_grads(model)
-
+ 
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
+ 
     opt.step()
-
+ 
     new_carry = TRM_RtifyCarry(
         inner_carry=TRMCarry(
             Z_S=new_carry.inner_carry.Z_S.detach(),
@@ -432,14 +436,14 @@ def train_one_rtify_step(
         last_logits=new_carry.last_logits.detach(),
         phi=new_carry.phi.detach(),
     )
-
+ 
     return new_carry, loss, metrics, all_finish
-
-
+ 
+ 
 # ------------------------------------------------------------
 # Train epoch
 # ------------------------------------------------------------
-
+ 
 def train_one_epoch(
     model,
     loss_head,
@@ -457,27 +461,29 @@ def train_one_epoch(
     global_batch_size,
     rank,
 ):
-
     model.train()
-
     step = step0
-
+ 
     for _, batch, _ in loader:
-
-        batch = {k: v.to(device).long() for k, v in batch.items()}
+ 
+        batch  = {k: v.to(device).long() for k, v in batch.items()}
         labels = batch["labels"]
-
-        carry = model.initial_carry(batch)
-
-        last_metrics = None
-        last_loss = None
-
+        carry  = model.initial_carry(batch)
+ 
+        sum_lm_loss      = 0.0
+        sum_halt_penalty = 0.0
+        sum_readiness    = 0.0
+        sum_evidence     = 0.0
+        sum_active       = 0.0
+        n_steps          = 0
+        last_theta       = None
+ 
         while True:
-
+ 
             lr_now = cosine_warmup_lr(step, base_lr, warmup, total_steps, min_ratio)
             for pg in opt.param_groups:
                 pg["lr"] = lr_now
-
+ 
             carry, loss, metrics, all_finish = train_one_rtify_step(
                 loss_head,
                 model,
@@ -485,62 +491,71 @@ def train_one_epoch(
                 carry,
                 opt,
                 global_batch_size=global_batch_size,
-                global_step=epoch+1
+                global_step=epoch + 1,         
             )
-
-            last_metrics = metrics
-            last_loss = loss
-
+ 
+            sum_lm_loss      += metrics["lm_loss"].item()
+            sum_halt_penalty += metrics["halt_penalty"].item()
+            sum_readiness    += metrics["readiness"].item()
+            sum_evidence     += metrics["evidence_sum"].item()
+            sum_active       += metrics["active_count"].item()
+            n_steps          += 1
+            last_theta        = metrics["theta"].item()
+ 
             step += 1
-
+ 
             local_done = carry.halted.all()
-
             if dist.is_initialized():
                 flag = torch.tensor([int(local_done)], device=device)
                 dist.all_reduce(flag, op=dist.ReduceOp.MIN)
                 global_done = bool(flag.item())
             else:
                 global_done = bool(local_done)
-
+ 
             if global_done:
                 break
-
-        count = float(last_metrics["count"])
-
-        acc = float(last_metrics["accuracy"] / max(count, 1))
-        acc_exact = float(last_metrics["exact_accuracy"] / max(count, 1))
-
-        steps_mean = float(last_metrics["steps_sum"] / max(count, 1))
-        phi_mean = float(last_metrics["phi_sum"] / max(count, 1))
-        evidence_mean = float(last_metrics["evidence_sum"] / max(count, 1))
-
-        theta = float(last_metrics["theta"])
-
+ 
+        final_logits = carry.last_logits          # [B, L, V]
+        steps_mean   = carry.steps.float().mean().item()
+        phi_mean     = carry.phi.float().mean().item()
+ 
+        c, t      = global_accuracy_counts(final_logits, labels, ignore_index=IGNORE_LABEL_ID)
+        acc_all   = c / max(t, 1)
+ 
+        c, t      = exact_accuracy_counts(final_logits, labels, ignore_index=IGNORE_LABEL_ID)
+        acc_exact = c / max(t, 1)
+ 
+        lm_loss_mean      = sum_lm_loss      / max(n_steps, 1)
+        halt_penalty_mean = sum_halt_penalty / max(n_steps, 1)
+        readiness_mean    = sum_readiness    / max(n_steps, 1)
+        evidence_mean     = sum_evidence     / max(sum_active, 1.0)
+ 
         if rank == 0 and use_wandb:
-
             wandb.log({
-                "train/lm_loss": float(last_metrics["lm_loss"]) / global_batch_size,
-                "train/halt_penalty": float(last_metrics["halt_penalty"]) / global_batch_size,
-                "train/readiness": float(last_metrics["readiness"]) / global_batch_size,
-                "train/accuracy": acc,
+                "train/accuracy":       acc_all,
                 "train/exact_accuracy": acc_exact,
-
-                "train/steps_mean": steps_mean,
-                "train/phi_mean": phi_mean,
-                "train/evidence_mean": evidence_mean,
-                "train/theta": theta,
-
-                "epoch": epoch + 1,
+                "train/steps_mean":     steps_mean,
+                "train/phi_mean":       phi_mean,
+ 
+                "train/lm_loss":        lm_loss_mean      / global_batch_size,
+                "train/halt_penalty":   halt_penalty_mean / global_batch_size,
+                "train/readiness":      readiness_mean    / global_batch_size,
+                "train/evidence_mean":  evidence_mean,
+ 
+                # Scalar
+                "train/theta":          last_theta,
+ 
+                "epoch":       epoch + 1,
                 "global_step": step,
             })
-
+ 
     return step
-
-
+ 
+ 
 # ------------------------------------------------------------
 # Evaluation
 # ------------------------------------------------------------
-
+ 
 @torch.no_grad()
 def evaluate(
     model,
@@ -551,75 +566,109 @@ def evaluate(
     max_batches,
     rank,
 ):
-
     loss_head.eval()
-
-    sum_metrics = {
-        "count": 0.0,
-        "accuracy": 0.0,
-        "exact_accuracy": 0.0,
-        "lm_loss": 0.0,
-        "halt_penalty": 0.0,
-        "total_loss": 0.0,
-        "steps_sum": 0.0,
-        "phi_sum": 0.0,
-        "evidence_sum": 0.0,
-    }
-
+ 
+    sum_lm_loss      = 0.0
+    sum_halt_penalty = 0.0
+    sum_evidence     = 0.0
+    sum_active       = 0.0
+    sum_total_loss   = 0.0
+    n_steps_total    = 0
+ 
+    sum_acc          = 0.0
+    sum_exact        = 0.0
+    sum_steps        = 0.0
+    sum_phi          = 0.0
+    n_samples        = 0
+ 
     iterable = loader if max_batches is None else islice(loader, max_batches)
-
+ 
     for _, batch, _ in iterable:
-
-        batch = {k: v.to(device).long() for k, v in batch.items()}
-
-        carry = model.initial_carry(batch)
-
-        last_metrics = None
-        last_loss = None
-
+ 
+        batch  = {k: v.to(device).long() for k, v in batch.items()}
+        labels = batch["labels"]
+        carry  = model.initial_carry(batch)
+ 
+        ep_lm_loss      = 0.0
+        ep_halt_penalty = 0.0
+        ep_evidence     = 0.0
+        ep_active       = 0.0
+        ep_total_loss   = 0.0
+        ep_steps        = 0
+ 
         while True:
-
             carry, loss, metrics, _, all_finish = loss_head(
                 carry=carry,
                 batch=batch,
                 return_keys=[],
             )
-
-            last_metrics = metrics
-            last_loss = loss
-
+ 
+            ep_lm_loss      += metrics["lm_loss"].item()
+            ep_halt_penalty += metrics["halt_penalty"].item()
+            ep_evidence     += metrics["evidence_sum"].item()
+            ep_active       += metrics["active_count"].item()
+            ep_total_loss   += loss.item()
+            ep_steps        += 1
+ 
             if bool(all_finish):
                 break
-
-        sum_metrics["count"] += float(last_metrics["count"])
-        sum_metrics["accuracy"] += float(last_metrics["accuracy"])
-        sum_metrics["exact_accuracy"] += float(last_metrics["exact_accuracy"])
-
-        sum_metrics["lm_loss"] += float(last_metrics["lm_loss"])
-        sum_metrics["halt_penalty"] += float(last_metrics["halt_penalty"])
-        sum_metrics["total_loss"] += float(last_loss.item())
-
-        sum_metrics["steps_sum"] += float(last_metrics["steps_sum"])
-        sum_metrics["phi_sum"] += float(last_metrics["phi_sum"])
-        sum_metrics["evidence_sum"] += float(last_metrics["evidence_sum"])
-
-    # DDP reduce
-    sum_metrics = ddp_sum_metrics(sum_metrics, device=device)
-
-    count = max(sum_metrics["count"], 1.0)
-
+ 
+        sum_lm_loss      += ep_lm_loss
+        sum_halt_penalty += ep_halt_penalty
+        sum_evidence     += ep_evidence
+        sum_active       += ep_active
+        sum_total_loss   += ep_total_loss
+        n_steps_total    += ep_steps
+ 
+        final_logits = carry.last_logits          # [B, L, V]
+        B            = final_logits.shape[0]
+ 
+        c, t  = global_accuracy_counts(final_logits, labels, ignore_index=IGNORE_LABEL_ID)
+        sum_acc   += c
+ 
+        c, t  = exact_accuracy_counts(final_logits, labels, ignore_index=IGNORE_LABEL_ID)
+        sum_exact += c
+ 
+        sum_steps += carry.steps.float().sum().item()
+        sum_phi   += carry.phi.float().sum().item()
+        n_samples += B
+ 
+    # DDP reduce — all fields
+    totals = ddp_sum_metrics(
+        {
+            "lm_loss":      sum_lm_loss,
+            "halt_penalty": sum_halt_penalty,
+            "total_loss":   sum_total_loss,
+            "evidence":     sum_evidence,
+            "active":       sum_active,
+            "n_steps":      float(n_steps_total),
+            "accuracy":     sum_acc,
+            "exact":        sum_exact,
+            "steps_sum":    sum_steps,
+            "phi_sum":      sum_phi,
+            "n_samples":    float(n_samples),
+        },
+        device=device,
+    )
+ 
+    n_samp  = max(totals["n_samples"], 1.0)
+    n_steps = max(totals["n_steps"],   1.0)
+    n_act   = max(totals["active"],    1.0)
+ 
     results = {
-        "lm_loss": sum_metrics["lm_loss"] / count,
-        "halt_penalty": sum_metrics["halt_penalty"] / count,
-        "total_loss": sum_metrics["total_loss"] / count,
-        "accuracy": sum_metrics["accuracy"] / count,
-        "exact_accuracy": sum_metrics["exact_accuracy"] / count,
-        "steps_mean": sum_metrics["steps_sum"] / count,
-        "phi_mean": sum_metrics["phi_sum"] / count,
-        "evidence_mean": sum_metrics["evidence_sum"] / count,
-        "theta": float(model.theta),
+        "lm_loss":      totals["lm_loss"]      / n_steps,
+        "halt_penalty": totals["halt_penalty"]  / n_steps,
+        "total_loss":   totals["total_loss"]    / n_steps,
+        "evidence_mean":totals["evidence"]      / n_act,
+ 
+        "accuracy":     totals["accuracy"]      / n_samp,
+        "exact_accuracy":totals["exact"]        / n_samp,
+        "steps_mean":   totals["steps_sum"]     / n_samp,
+        "phi_mean":     totals["phi_sum"]       / n_samp,
+ 
+        "theta": float(model._orig_mod.theta),
     }
-
+ 
     return results
 
 

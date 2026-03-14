@@ -141,13 +141,11 @@ class RTifyLossHead(nn.Module):
 
     def __init__(self, model: nn.Module, loss_type: str = "stablemax_cross_entropy"):
         super().__init__()
-        self.model    = model
-        self.loss_fn  = globals()[loss_type]
-
-        self.lambda_halt = float(model.config.lambda_halt)
-        self.lambda_ready = model.config.lambda_ready
-
-
+        self.model        = model
+        self.loss_fn      = globals()[loss_type]
+        self.lambda_halt  = float(model.config.lambda_halt)
+        self.lambda_ready = float(model.config.lambda_ready)
+ 
     def forward(
         self,
         *,
@@ -155,21 +153,21 @@ class RTifyLossHead(nn.Module):
         batch: Dict[str, torch.Tensor],
         return_keys: Sequence[str] = (),
     ) -> Tuple[Any, torch.Tensor, Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]], torch.Tensor]:
-
+ 
         new_carry, outputs = self.model(carry=carry, batch=batch)
-
+ 
         labels   = batch["labels"]
         logits   = outputs["logits"]     # [B, L, V]
-        g_logit  = outputs['g_logit']
+        g_logit  = outputs["g_logit"]    # [B]  pre-Softplus, in compute graph
         evidence = outputs["evidence"]   # [B]  > 0, in compute graph
-        active   = outputs["active"]     # [B]  bool: samples that ran this step
+        active   = outputs["active"]     # [B]  bool: ~prev_halted
         phi      = outputs["phi"]        # [B]  detached Φ
         theta    = outputs["theta"]      # scalar
-
+ 
         mask         = (labels != IGNORE_LABEL_ID)          # [B, L]
         loss_counts  = mask.sum(-1)                         # [B]
         loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)  # [B, 1]
-
+ 
         lm_loss = (
             self.loss_fn(
                 logits,
@@ -178,69 +176,42 @@ class RTifyLossHead(nn.Module):
                 valid_mask=mask,
             ) / loss_divisor
         ).sum()
-
+ 
         with torch.no_grad():
-            preds          = logits.argmax(-1)                        # [B, L]
-            is_correct     = mask & (preds == labels)                 # [B, L]
-            seq_is_correct = (is_correct.sum(-1) == loss_counts)      # [B]
-            seq_correct = is_correct.float().sum(-1) / loss_counts.float()                  # [B] for BCE
-
-
+            preds          = logits.argmax(-1)                              # [B, L]
+            is_correct     = mask & (preds == labels)                       # [B, L]
+            seq_is_correct = (is_correct.sum(-1) == loss_counts)            # [B] bool
+            seq_correct    = is_correct.float().sum(-1) / loss_counts.float()  # [B]
+ 
         n_active = active.float().sum().clamp_min(1.0)
         readiness_loss = F.binary_cross_entropy_with_logits(
             g_logit,
             seq_correct,
-            weight=active.float(), 
+            weight=active.float(),
             reduction="sum",
         ) / n_active
-
         readiness_penalty = self.lambda_ready * readiness_loss
-
-        # ── Halt penalty ───────────────────────────────────────────────
-        # Only penalise evidence from ACTIVE (not yet halted) samples.
-        # Halted samples froze their state; their fw still runs but we
-        # should not penalise them again (they already paid their cost).
-        # Mean over active samples → scale O(1), batch-size-independent.
-        n_active     = active.float().sum().clamp_min(1.0)
+ 
         halt_penalty = self.lambda_halt * (evidence * active.float()).sum() / n_active
-
-        # total_loss = lm_loss + halt_penalty
+ 
         total_loss = lm_loss + halt_penalty + readiness_penalty
-
+ 
         with torch.no_grad():
-            # preds          = logits.argmax(-1)              # [B, L]
-            # is_correct     = mask & (preds == labels)       # [B, L]
-            # seq_is_correct = (is_correct.sum(-1) == loss_counts)  # [B]
-
-            just_halted   = outputs["just_halted"]          # [B]
-            valid_metrics = just_halted & (loss_counts > 0) # [B]
-
             metrics = {
-                "count":          valid_metrics.sum(),
-                "accuracy":       torch.where(
-                    valid_metrics,
-                    (is_correct.float() / loss_divisor).sum(-1),
-                    0.0,
-                ).sum(),
-                "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
-
-                "lm_loss":        lm_loss.detach(),
-                "halt_penalty":   halt_penalty.detach(),
-                "readiness":      readiness_penalty.detach(),
-
-                "steps_sum":      torch.where(valid_metrics, new_carry.steps.float(), 0.0).sum(),
-                "phi_sum":        torch.where(valid_metrics, phi, 0.0).sum(),
-
-                "evidence_sum":   (evidence.detach() * active.float()).sum(),
-                "active_count":   active.float().sum(),
-
-                "theta":          theta.detach(),
+                "lm_loss":       lm_loss.detach(),
+                "halt_penalty":  halt_penalty.detach(),
+                "readiness":     readiness_penalty.detach(),
+ 
+                "evidence_sum":  (evidence.detach() * active.float()).sum(),
+                "active_count":  active.float().sum(),
+ 
+                "theta":         theta.detach(),
             }
-
+ 
         detached_outputs = (
             {k: outputs[k].detach() for k in return_keys if k in outputs}
             if return_keys else None
         )
         all_finish = new_carry.halted.all()
-
+ 
         return new_carry, total_loss, metrics, detached_outputs, all_finish

@@ -29,5 +29,5 @@ train_theta: True
 detach_fw_input: False     
 train_fixed_steps: False 
 fw_hidden_mult: 1.0  
-lambda_halt: 1e-5 
+lambda_halt: 0.1 
 lambda_ready: 0.1
