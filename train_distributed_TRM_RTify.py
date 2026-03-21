@@ -697,13 +697,13 @@ def main(hydra_cfg: DictConfig):
             print("[model] compile enabled")
     loss_head = RTifyLossHead(model)
 
-    theta_params = [p for n, p in model.named_parameters() if "theta" in n]
-    other_params = [p for n, p in model.named_parameters() if "theta" not in n]
+    psi_params   = [p for n, p in model.named_parameters() if n.endswith(".psi")]
+    other_params = [p for n, p in model.named_parameters() if not n.endswith(".psi")]
 
     opt = torch.optim.AdamW(
         [
             {"params": other_params, "lr": cfg.lr},
-            {"params": theta_params, "lr": cfg.lr * 0.1},   # 10× smaller for θ
+            {"params": psi_params, "lr": cfg.lr * 0.1},   # 10× smaller for θ
         ],
         weight_decay=cfg.weight_decay,
         betas=(cfg.beta1, cfg.beta2),

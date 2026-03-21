@@ -122,21 +122,17 @@ class RTifyLossHead(nn.Module):
 
     Loss at supervision step m:
 
-        L_m = CE(logits_m, y) + λ * mean(e_m[active])
+        L_m = CE(logits_m, y)
+            + lambda_halt  * mean(e_m[active])
+            + lambda_ready * BCE(g_m, frac_correct[active])
+            + lambda_tau   * mean(tau[just_halted])
 
-    where active = ~prev_halted.
+    where:
+        active      = ~prev_halted
+        tau         = t* - (Phi_{t*} - theta) / e_{t*}   (RTify Taylor approx)
 
-    Key design decisions:
-    - lm_loss   : summed over batch after per-token normalisation
-                  → scale: O(B)
-    - halt_penalty: λ * mean over ACTIVE samples only
-                  → scale: O(1), independent of batch size
-                  → λ therefore has a consistent, interpretable meaning
-                     regardless of batch size or how many samples have halted
-
-    Penalising e_m (not Φ_m) is sufficient because Φ_m = Σ e_i, so
-    minimising each e_i is equivalent to minimising the stopping time.
-    No survival function, no KL divergence, no RL needed.
+    lambda_tau=0 disables the tau term entirely (default).
+    Set lambda_tau > 0 together with train_theta=True to make theta trainable.
     """
 
     def __init__(self, model: nn.Module, loss_type: str = "stablemax_cross_entropy"):
@@ -145,7 +141,8 @@ class RTifyLossHead(nn.Module):
         self.loss_fn      = globals()[loss_type]
         self.lambda_halt  = float(model.config.lambda_halt)
         self.lambda_ready = float(model.config.lambda_ready)
- 
+        self.lambda_tau   = float(model.config.lambda_tau)
+
     def forward(
         self,
         *,
@@ -153,21 +150,25 @@ class RTifyLossHead(nn.Module):
         batch: Dict[str, torch.Tensor],
         return_keys: Sequence[str] = (),
     ) -> Tuple[Any, torch.Tensor, Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]], torch.Tensor]:
- 
+
         new_carry, outputs = self.model(carry=carry, batch=batch)
- 
+
         labels   = batch["labels"]
-        logits   = outputs["logits"]     # [B, L, V]
-        g_logit  = outputs["g_logit"]    # [B]  pre-Softplus, in compute graph
-        evidence = outputs["evidence"]   # [B]  > 0, in compute graph
-        active   = outputs["active"]     # [B]  bool: ~prev_halted
-        phi      = outputs["phi"]        # [B]  detached Φ
-        theta    = outputs["theta"]      # scalar
- 
-        mask         = (labels != IGNORE_LABEL_ID)          # [B, L]
-        loss_counts  = mask.sum(-1)                         # [B]
+        logits   = outputs["logits"]        # [B, L, V]
+        g_logit  = outputs["g_logit"]       # [B]  pre-Softplus, in compute graph
+        evidence = outputs["evidence"]      # [B]  > 0, in compute graph
+        active   = outputs["active"]        # [B]  bool: ~prev_halted
+        phi      = outputs["phi"]           # [B]  detached Phi
+        theta    = outputs["theta"]         # scalar, in graph if train_theta=True
+        tau      = outputs["tau"]           # [B]  in graph via e and theta
+        just_halted = outputs["just_halted"]  # [B]  bool
+        allow_threshold = outputs["allow_threshold"]
+
+        mask         = (labels != IGNORE_LABEL_ID)             # [B, L]
+        loss_counts  = mask.sum(-1)                            # [B]
         loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)  # [B, 1]
- 
+
+        # ── Task loss ──────────────────────────────────────────────────
         lm_loss = (
             self.loss_fn(
                 logits,
@@ -176,13 +177,19 @@ class RTifyLossHead(nn.Module):
                 valid_mask=mask,
             ) / loss_divisor
         ).sum()
- 
+
+        # ── Correctness targets (no grad) ──────────────────────────────
         with torch.no_grad():
-            preds          = logits.argmax(-1)                              # [B, L]
-            is_correct     = mask & (preds == labels)                       # [B, L]
-            seq_is_correct = (is_correct.sum(-1) == loss_counts)            # [B] bool
-            seq_correct    = is_correct.float().sum(-1) / loss_counts.float()  # [B]
- 
+            preds       = logits.argmax(-1)                                # [B, L]
+            is_correct  = mask & (preds == labels)                         # [B, L]
+            # Soft target: fraction of tokens correct in [0, 1].
+            # Better than binary for hard tasks — fw gets a gradient even
+            # when the model is only partially correct.
+            seq_correct = is_correct.float().sum(-1) / loss_counts.float() # [B]
+
+        # ── Readiness loss ─────────────────────────────────────────────
+        # fw predicts how correct the current answer is.
+        # Weighted to active samples only — halted samples have frozen Z_S.
         n_active = active.float().sum().clamp_min(1.0)
         readiness_loss = F.binary_cross_entropy_with_logits(
             g_logit,
@@ -191,27 +198,48 @@ class RTifyLossHead(nn.Module):
             reduction="sum",
         ) / n_active
         readiness_penalty = self.lambda_ready * readiness_loss
- 
+
+        # ── Halt penalty ───────────────────────────────────────────────
+        # Penalise evidence emitted by active samples.
+        # Mean over active → scale O(1), batch-size-independent.
         halt_penalty = self.lambda_halt * (evidence * active.float()).sum() / n_active
- 
-        total_loss = lm_loss + halt_penalty + readiness_penalty
- 
+
+        # ── Tau loss (differentiable stopping time) ────────────────────
+        # Only applied when lambda_tau > 0 and train_theta = True.
+        # Gives theta a gradient path via dL/d(theta) = -lambda_tau / e_{t*}.
+        # Masked to just-halted samples — tau is undefined for others.
+        if self.lambda_tau > 0 and allow_threshold:
+            n_halted    = just_halted.float().sum().clamp_min(1.0)
+            tau_penalty = self.lambda_tau * (tau * just_halted.float()).sum() / n_halted
+        else:
+            tau_penalty = torch.tensor(0.0, device=lm_loss.device)
+
+        total_loss = lm_loss + halt_penalty + readiness_penalty + tau_penalty
+
+        # ── Metrics ────────────────────────────────────────────────────
+        # No final-state metrics here (accuracy, steps, phi).
+        # Those are read from carry after the episode loop in the training
+        # script, exactly as ACT does — avoids all divide-by-zero drops.
         with torch.no_grad():
             metrics = {
-                "lm_loss":       lm_loss.detach(),
-                "halt_penalty":  halt_penalty.detach(),
-                "readiness":     readiness_penalty.detach(),
- 
-                "evidence_sum":  (evidence.detach() * active.float()).sum(),
-                "active_count":  active.float().sum(),
- 
-                "theta":         theta.detach(),
+                # Process metrics — accumulate over steps, divide by n_steps
+                "lm_loss":      lm_loss.detach(),
+                "halt_penalty": halt_penalty.detach(),
+                "readiness":    readiness_penalty.detach(),
+                "tau_penalty":  tau_penalty.detach(),
+
+                # Evidence — sum and count kept separate for correct averaging
+                "evidence_sum": (evidence.detach() * active.float()).sum(),
+                "active_count": active.float().sum(),
+
+                # Scalar — just take last value after episode loop
+                "theta":        theta.detach(),
             }
- 
+
         detached_outputs = (
             {k: outputs[k].detach() for k in return_keys if k in outputs}
             if return_keys else None
         )
         all_finish = new_carry.halted.all()
- 
+
         return new_carry, total_loss, metrics, detached_outputs, all_finish
