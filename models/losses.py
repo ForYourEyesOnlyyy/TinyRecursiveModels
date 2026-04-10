@@ -185,7 +185,7 @@ class RTifyLossHead(nn.Module):
             # Soft target: fraction of tokens correct in [0, 1].
             # Better than binary for hard tasks — fw gets a gradient even
             # when the model is only partially correct.
-            seq_correct = is_correct.float().sum(-1) / loss_counts.float() # [B]
+            seq_correct = is_correct.float().sum(-1) / loss_counts.float().clamp_min(1) # [B]
 
         # ── Readiness loss ─────────────────────────────────────────────
         # fw predicts how correct the current answer is.
