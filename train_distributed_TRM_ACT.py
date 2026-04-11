@@ -646,8 +646,11 @@ def main(hydra_cfg: DictConfig):
     model = build_model_from_cfg(cfg, train_meta, device)
     if torch.cuda.is_available() and "DISABLE_COMPILE" not in os.environ:
         model = torch.compile(model)
+        total = sum(p.numel() for p in model.parameters())
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         if is_main:
             print("[model] compile enabled")
+            print(f"Total: {total:,} | Trainable: {trainable:,}")
     loss_head = ACTLossHead(model)
 
     opt = torch.optim.AdamW(

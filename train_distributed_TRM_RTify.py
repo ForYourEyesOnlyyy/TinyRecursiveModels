@@ -564,6 +564,7 @@ def evaluate(
     device,
     *,
     max_batches,
+    global_batch_size,
     rank,
 ):
     loss_head.eval()
@@ -603,11 +604,11 @@ def evaluate(
                 return_keys=[],
             )
  
-            ep_lm_loss      += metrics["lm_loss"].item()
-            ep_halt_penalty += metrics["halt_penalty"].item()
+            ep_lm_loss      += metrics["lm_loss"].item()      / global_batch_size
+            ep_halt_penalty += metrics["halt_penalty"].item() / global_batch_size
+            ep_total_loss   += loss.item()                    / global_batch_size
             ep_evidence     += metrics["evidence_sum"].item()
             ep_active       += metrics["active_count"].item()
-            ep_total_loss   += loss.item()
             ep_steps        += 1
  
             if bool(all_finish):
@@ -693,8 +694,11 @@ def main(hydra_cfg: DictConfig):
     model = build_model_from_cfg(cfg, train_meta, device)
     if torch.cuda.is_available() and "DISABLE_COMPILE" not in os.environ:
         model = torch.compile(model)
+        total = sum(p.numel() for p in model.parameters())
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         if is_main:
             print("[model] compile enabled")
+            print(f"Total: {total:,} | Trainable: {trainable:,}")
     loss_head = RTifyLossHead(model)
 
     psi_params   = [p for n, p in model.named_parameters() if n.endswith(".psi")]
@@ -703,7 +707,7 @@ def main(hydra_cfg: DictConfig):
     opt = torch.optim.AdamW(
         [
             {"params": other_params, "lr": cfg.lr},
-            {"params": psi_params, "lr": cfg.lr * 0.1},   # 10× smaller for θ
+            {"params": psi_params, "lr": cfg.lr * 0.01},   # 100× smaller for θ
         ],
         weight_decay=cfg.weight_decay,
         betas=(cfg.beta1, cfg.beta2),
@@ -799,6 +803,7 @@ def main(hydra_cfg: DictConfig):
                 eval_loader,
                 device,
                 max_batches=cfg.max_eval_batches,
+                global_batch_size=cfg.global_batch_size,
                 rank=rank,
             )
 
