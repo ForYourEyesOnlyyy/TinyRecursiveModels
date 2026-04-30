@@ -1,7 +1,7 @@
 torchrun --standalone --nproc_per_node=4 train_distributed.py \
   device=cuda \
   arch=trm_noACT \
-  data_paths="[data/sudoku-extreme-2k-aug-1000]" \
+  data_paths="[data/sudoku-extreme-1k-aug-1000]" \
   global_batch_size=768 \
   epochs=1 \
   eval_interval=0 \
