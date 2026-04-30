@@ -1,0 +1,50 @@
+[
+  {
+    "theta": 10.001,
+    "exact_accuracy": 0.770748260738052,
+    "mean_steps": 5.012692358590441,
+    "total_puzzles": 423168
+  },
+  {
+    "theta": 11.0,
+    "exact_accuracy": 0.7796926988808227,
+    "mean_steps": 5.542051856473079,
+    "total_puzzles": 423168
+  },
+  {
+    "theta": 12.0,
+    "exact_accuracy": 0.7876375340290381,
+    "mean_steps": 5.96762515124017,
+    "total_puzzles": 423168
+  },
+  {
+    "theta": 14.0,
+    "exact_accuracy": 0.8007765237447066,
+    "mean_steps": 6.494288320477919,
+    "total_puzzles": 423168
+  },
+  {
+    "theta": 16.0,
+    "exact_accuracy": 0.8112711736237145,
+    "mean_steps": 7.3620547867513615,
+    "total_puzzles": 423168
+  },
+  {
+    "theta": 20.0,
+    "exact_accuracy": 0.8207922149122807,
+    "mean_steps": 8.326274671052632,
+    "total_puzzles": 423168
+  },
+  {
+    "theta": 30.0,
+    "exact_accuracy": 0.8208442037205081,
+    "mean_steps": 10.209415645795524,
+    "total_puzzles": 423168
+  },
+  {
+    "theta": 40.0,
+    "exact_accuracy": 0.8206362484875983,
+    "mean_steps": 11.884700638989715,
+    "total_puzzles": 423168
+  }
+]
